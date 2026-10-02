@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { hasPermission } from "../../../../lib/permissions";
 import { authenticateFtmRequest } from "../../../../lib/server/ftmRequestAuth";
-import { normalizeTrip, validateTripAssignment } from "../../../../lib/server/ftmTrips";
+import { normalizeTrip, updateRemoteParcelStatus, validateTripAssignment } from "../../../../lib/server/ftmTrips";
 
 export const dynamic = "force-dynamic";
 
@@ -48,6 +48,16 @@ export async function POST(request: Request, { params }: { params: { id: string 
     if (assignmentError) return NextResponse.json({ error: `Trip accepted, but the shared assignment could not be synchronized: ${assignmentError.message}` }, { status: 500 });
     const { error: bookingError } = await supabase.from("bookings").update({ status: "DRIVER_VEHICLE_ASSIGNED" }).eq("id", data.booking_id);
     if (bookingError) return NextResponse.json({ error: `Trip accepted, but the booking status could not be synchronized: ${bookingError.message}` }, { status: 500 });
+  }
+  if (data.booking_id) {
+    const parcelSyncError = await updateRemoteParcelStatus(supabase, data.booking_id, "in_transit");
+    if (parcelSyncError) {
+      return NextResponse.json({
+        error: "Trip accepted, but its linked parcels could not be marked in transit.",
+        details: parcelSyncError,
+        trip_id: data.id,
+      }, { status: 500 });
+    }
   }
   return NextResponse.json(normalizeTrip(data));
 }

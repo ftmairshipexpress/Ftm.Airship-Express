@@ -133,16 +133,27 @@ export async function updateTripResources(supabase: SupabaseClient, resources: {
   });
 }
 
-export async function updateRemoteParcelStatus(supabase: SupabaseClient, bookingId: string, status: string) {
+export async function updateRemoteParcelStatus(supabase: SupabaseClient, bookingId: string, status: string): Promise<string | null> {
   const parcels = createFtmParcelClient();
-  if (!parcels) return;
-  const { data: booking, error: bookingError } = await supabase.from("bookings").select("cargo_description").eq("id", bookingId).maybeSingle();
-  const parcelIds = !bookingError ? String(booking?.cargo_description || "").match(/parcel_ids=([^;\s]+)/i)?.[1]?.split(",").map((id) => id.trim()).filter(Boolean) || [] : [];
-  if (!parcelIds.length) return;
-  const { error } = await parcels.from("parcels").update({ status }).in("id", parcelIds);
-  if (error && !/Could not find the table|public\.parcels|column .* does not exist/i.test(error.message)) {
-    console.error("Failed to update remote parcels by manifest IDs:", error.message);
+  if (!parcels) return "Parcel database is not configured.";
+  let booking: Record<string, any> | null;
+  let bookingError: { message: string } | null;
+  const bookingResult = await supabase.from("bookings").select("parcel_ids,cargo_description").eq("id", bookingId).maybeSingle();
+  booking = bookingResult.data as Record<string, any> | null;
+  bookingError = bookingResult.error;
+  if (bookingError && /parcel_ids.*does not exist|column .*parcel_ids/i.test(bookingError.message)) {
+    const fallback = await supabase.from("bookings").select("cargo_description").eq("id", bookingId).maybeSingle();
+    booking = fallback.data as Record<string, any> | null;
+    bookingError = fallback.error;
   }
+  if (bookingError) return `Unable to load the booking parcel manifest: ${bookingError.message}`;
+  const manifestIds = String(booking?.cargo_description || "").match(/parcel_ids=([^;\s]+)/i)?.[1]?.split(",").map((id) => id.trim()).filter(Boolean) || [];
+  const parcelIds = [...new Set([...(Array.isArray(booking?.parcel_ids) ? booking.parcel_ids : []), ...manifestIds].map(String).filter(Boolean))];
+  if (!parcelIds.length) return null;
+  const { data, error } = await parcels.from("parcels").update({ status }).in("id", parcelIds).select("id");
+  if (error) return `Unable to update linked parcels: ${error.message}`;
+  if (!data?.length) return "No linked parcel records were updated.";
+  return null;
 }
 
 export async function notifyDriverTripAssigned(supabase: SupabaseClient, trip: TripRecord) {
