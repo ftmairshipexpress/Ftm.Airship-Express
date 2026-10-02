@@ -991,7 +991,7 @@ export default function VrdsRoutePlanningPage() {
     const vehicle = courierVehicle
       ?? availableVehicleOptions.find((option) => option.status === "Available")
       ?? availableVehicleOptions[0];
-    const fuelEfficiencyKmPerL = Number(courierVehicle?.fuelEfficiencyKmPerL);
+    const fuelEfficiencyKmPerL = Number(vehicle?.fuelEfficiencyKmPerL);
     const res = await fetch("/api/optimize-route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1004,7 +1004,8 @@ export default function VrdsRoutePlanningPage() {
         fuelEfficiencyKmPerL: Number.isFinite(fuelEfficiencyKmPerL) && fuelEfficiencyKmPerL > 0
           ? fuelEfficiencyKmPerL
           : undefined,
-        optimizationMode: "balanced",
+        optimizationMode: "fastest",
+        timeLimitSecs: 10,
         prioritizeFuelEfficiency: false,
       }),
     });
