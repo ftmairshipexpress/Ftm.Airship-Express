@@ -259,7 +259,7 @@ function normalizeParcelStatus(raw: unknown, parcel?: Record<string, unknown>): 
 
 function isTripInTransitStatus(raw: unknown) {
   const value = String(raw ?? "").trim().toLowerCase().replace(/[_-]+/g, " ");
-  return /\b(in transit|transit|dispatched|dispatch|delivering|moving|en route|on route)\b/.test(value);
+  return /\b(accepted|scheduled|in transit|transit|dispatched|dispatch|delivering|moving|en route|on route)\b/.test(value);
 }
 
 function isTripBookedStatus(raw: unknown) {
