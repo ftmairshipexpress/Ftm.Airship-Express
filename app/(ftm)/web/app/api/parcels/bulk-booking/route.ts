@@ -90,8 +90,12 @@ export async function POST(request: Request) {
   const { error: routeBookingLinkError } = await bookingsSupabase
     .from("route_plan_bookings")
     .upsert({ route_plan_id: linkedRoutePlanId, booking_id: booking.id }, { onConflict: "route_plan_id,booking_id" });
-  const legacyRouteBookingLinkSchema = routeBookingLinkError?.code === "42703"
-    && /route_plan_bookings\.route_plan_id/i.test(routeBookingLinkError.message);
+  const legacyRouteBookingLinkSchema = Boolean(routeBookingLinkError
+    && /route_plan_bookings/i.test(routeBookingLinkError.message)
+    && /route_plan_id/i.test(routeBookingLinkError.message)
+    && (routeBookingLinkError.code === "42703"
+      || routeBookingLinkError.code === "PGRST204"
+      || /schema cache/i.test(routeBookingLinkError.message)));
   if (routeBookingLinkError && !legacyRouteBookingLinkSchema) {
     return NextResponse.json({ error: `Booking ${booking.id} was saved, but its route-plan link failed: ${routeBookingLinkError.message}`, booking_id: booking.id }, { status: 500 });
   }
