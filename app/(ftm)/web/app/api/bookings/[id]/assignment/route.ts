@@ -145,7 +145,7 @@ export async function PATCH(request: Request, { params }: { params: { id: string
 
   if (data.route_plan_id) {
     const [{ data: routePlan, error: routePlanLookupError }, { data: assignedVehicle, error: vehicleLookupError }] = await Promise.all([
-      supabase.from("route_plans").select("vehicle_info,driver_info,optimization_result,baseline_distance_km,optimized_distance_km,fuel_savings_pct").eq("id", data.route_plan_id).maybeSingle(),
+      supabase.from("route_plans").select("vehicle_info,driver_info,optimization_result,baseline_distance_km,optimized_distance_km").eq("id", data.route_plan_id).maybeSingle(),
       supabase.from("vehicles").select("id,plate_number,vehicle_type,capacity_kg,fuel_efficiency,courier_id").eq("id", vehicle_id).maybeSingle(),
     ]);
     const syncLookupError = routePlanLookupError || vehicleLookupError;
