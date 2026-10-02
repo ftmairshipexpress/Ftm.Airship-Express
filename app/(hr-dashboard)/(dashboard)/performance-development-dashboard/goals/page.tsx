@@ -1,0 +1,323 @@
+import { redirect } from "next/navigation";
+import { NextResponse } from "next/server";
+import { supabaseAdmin } from "@/app/(hr-dashboard)/supabase/admin-client";
+import { getAuthenticatedActor } from "@/performance-development-dashboard/lib/auth/actor";
+import {
+  cachedPerDevAccountType,
+  loginRouteForAccountType,
+} from "@/performance-development-dashboard/lib/auth/redirect";
+import { resolveManagerDirectReportUuids } from "@/performance-development-dashboard/lib/auth/access";
+import { isPerDevHrAdminRole } from "@/performance-development-dashboard/lib/auth/hrIdentity";
+import { listPerformanceGoals } from "@/performance-development-dashboard/lib/performance/goals";
+import {
+  chooseCurrentCycle,
+  listPerformanceCycles,
+} from "@/performance-development-dashboard/lib/performance/cycles";
+import { GoalsManagement } from "@/performance-development-dashboard/components/goals/GoalsManagement";
+import type {
+  CurrentPerDevUser,
+  EmployeeOption,
+  PerformanceCycle,
+  PerformanceGoal,
+} from "@/performance-development-dashboard/types";
+
+export const dynamic = "force-dynamic";
+
+function fullName(firstName: string, lastName: string): string {
+  return `${firstName ?? ""} ${lastName ?? ""}`.trim();
+}
+
+/**
+ * Row shape for the optional employee-derived fields used by the Goal Create
+ * modal. `job_position` is the embedded `hr1_job_positions` join resolved via
+ * `hr1_employees.job_position_id` (same pattern the workforce dashboards use).
+ */
+type EmployeeRow = {
+  id: string;
+  first_name: string | null;
+  last_name: string | null;
+  department: string | null;
+  manager_id: string | null;
+  job_position_id: string | null;
+  /**
+   * Runtime verified as a single object (or null) for a to-one embed. Also
+   * accepts the array shape so both lookups are defended against.
+   */
+  job_position?: { title: string | null } | { title: string | null }[] | null;
+};
+
+function resolvePositionTitle(
+  jobPosition: EmployeeRow["job_position"]
+): string | null {
+  if (!jobPosition) return null;
+  const row = Array.isArray(jobPosition) ? jobPosition[0] : jobPosition;
+  return row?.title ?? null;
+}
+
+/**
+ * Batches one lookup for all distinct reporting-manager ids referenced by the
+ * given employee rows. Position titles come from the embedded join on the
+ * employee query itself, so managers are the only extra round trip.
+ */
+async function resolveManagerNames(
+  rows: EmployeeRow[]
+): Promise<Record<string, string>> {
+  const managerIds = [
+    ...new Set(
+      rows
+        .map((row) => row.manager_id)
+        .filter((id): id is string => Boolean(id))
+    ),
+  ];
+  if (managerIds.length === 0) return {};
+
+  const { data, error } = await supabaseAdmin
+    .from("hr1_employees")
+    .select("id, first_name, last_name")
+    .in("id", managerIds);
+
+  if (error) {
+    console.error("resolveManagerNames: query error:", error);
+    return {};
+  }
+
+  const names: Record<string, string> = {};
+  for (const manager of data ?? []) {
+    names[manager.id] = fullName(manager.first_name, manager.last_name);
+  }
+  return names;
+}
+
+function toEmployeeOption(
+  employee: EmployeeRow,
+  managerNamesById: Record<string, string>
+): EmployeeOption {
+  return {
+    id: employee.id,
+    name: fullName(employee.first_name ?? "", employee.last_name ?? ""),
+    department: employee.department,
+    job_position_id: employee.job_position_id,
+    position: resolvePositionTitle(employee.job_position),
+    managerId: employee.manager_id,
+    managerName: employee.manager_id
+      ? managerNamesById[employee.manager_id] ?? null
+      : null,
+  };
+}
+
+async function resolveReferencedNames(
+  goals: PerformanceGoal[]
+): Promise<{
+  cycleNamesById: Record<string, string>;
+  employeeNamesById: Record<string, string>;
+}> {
+  const cycleIds = [
+    ...new Set(goals.map((g) => g.cycle_id).filter(Boolean)),
+  ] as string[];
+  const employeeIds = [
+    ...new Set(
+      goals.flatMap((g) => [g.employee_id, g.assigned_by]).filter(Boolean)
+    ),
+  ] as string[];
+
+  const [cycleResult, employeeResult] = await Promise.all([
+    cycleIds.length > 0
+      ? supabaseAdmin
+          .from("hr3_performance_cycles")
+          .select("id, name")
+          .in("id", cycleIds)
+      : Promise.resolve({ data: null, error: null }),
+    employeeIds.length > 0
+      ? supabaseAdmin
+          .from("hr1_employees")
+          .select("id, first_name, last_name")
+          .in("id", employeeIds)
+      : Promise.resolve({ data: null, error: null }),
+  ]);
+
+  const cycleNamesById: Record<string, string> = {};
+  for (const cycle of cycleResult.data ?? []) {
+    cycleNamesById[cycle.id] = cycle.name;
+  }
+
+  const employeeNamesById: Record<string, string> = {};
+  for (const employee of employeeResult.data ?? []) {
+    employeeNamesById[employee.id] = fullName(
+      employee.first_name,
+      employee.last_name
+    );
+  }
+
+  return { cycleNamesById, employeeNamesById };
+}
+
+/**
+ * Employee/Manager-safe proposal cycle choices (read-only).
+ *
+ * The HR cycle administration list (`listPerformanceCycles`) requires
+ * PerDev HR Admin scope, so the manager/employee Goals branches historically
+ * received `cycles={[]}` and every proposal saved `cycle_id=NULL`. Reading a
+ * cycle to select it for a proposal is not cycle administration: this loads
+ * only usable (non-closed) cycles with the same display fields HR receives,
+ * newest first. No mutation, no privileged controls, no scope widening — the
+ * proposal and submit services remain authoritative (existence + not-closed).
+ */
+async function loadProposalCycles(): Promise<PerformanceCycle[]> {
+  const { data, error } = await supabaseAdmin
+    .from("hr3_performance_cycles")
+    .select(
+      "id, name, period_start, period_end, status, stage, created_by, created_at, opened_at, closed_at"
+    )
+    .neq("status", "closed")
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false });
+
+  if (error) {
+    console.error("loadProposalCycles: query error:", error);
+    return [];
+  }
+
+  return (data ?? []) as PerformanceCycle[];
+}
+
+export default async function GoalsPage() {
+  const actor = await getAuthenticatedActor();
+  if (actor instanceof NextResponse) redirect(loginRouteForAccountType(cachedPerDevAccountType()));
+
+  const serverUser: CurrentPerDevUser = {
+    fullName: actor.accountFullName,
+    role: actor.role,
+    email: actor.accountEmail,
+  };
+
+  const goalsResult = await listPerformanceGoals({});
+  const goals = goalsResult instanceof NextResponse ? [] : goalsResult;
+  const initialError =
+    goalsResult instanceof NextResponse
+      ? "Failed to load goals. Please try again."
+      : undefined;
+
+  const names = await resolveReferencedNames(goals);
+
+  // PerDev-aware HR branch: actorType alone is not sufficient evidence of
+  // PerDev HR Admin (super_admin / hr_performance_admin). Non-PerDev HR
+  // falls through to the scoped branches below, matching API enforcement.
+  const isPerDevHrAdmin =
+    actor.actorType === "hr_admin" && isPerDevHrAdminRole(actor.role);
+
+  if (isPerDevHrAdmin) {
+    const [cyclesResult, employeesResult] = await Promise.all([
+      listPerformanceCycles(),
+      // New-assignment selector: active employees only. Historical goal rows
+      // (including inactive owners) still load via listPerformanceGoals and
+      // resolve names through resolveReferencedNames below.
+      supabaseAdmin
+        .from("hr1_employees")
+        .select(
+          "id, first_name, last_name, department, manager_id, job_position_id, job_position:hr1_job_positions(title)"
+        )
+        .eq("status", "active")
+        .order("last_name", { ascending: true })
+        .order("first_name", { ascending: true }),
+    ]);
+
+    const cycles = cyclesResult instanceof NextResponse ? [] : cyclesResult;
+
+    const employeeRows = (employeesResult.data ?? []) as unknown as EmployeeRow[];
+    const managerNamesById = await resolveManagerNames(employeeRows);
+
+    const employees: EmployeeOption[] = employeeRows.map((e) =>
+      toEmployeeOption(e, managerNamesById)
+    );
+
+    const defaultCycleId = chooseCurrentCycle(cycles as PerformanceCycle[])?.id;
+
+    const departments = [...new Set(
+      employeeRows
+        .map((e) => (e.department ?? "").trim())
+        .filter((department) => department !== "")
+    )].sort((a, b) => a.localeCompare(b));
+
+    return (
+      <GoalsManagement
+        serverUser={serverUser}
+        actorType="hr_admin"
+        isPerDevHrAdmin={isPerDevHrAdmin}
+        initialGoals={goals}
+        initialError={initialError}
+        cycles={cycles as PerformanceCycle[]}
+        employees={employees}
+        cycleNamesById={names.cycleNamesById}
+        employeeNamesById={names.employeeNamesById}
+        defaultCycleId={defaultCycleId}
+        departments={departments}
+        actorEmployeeId={actor.employeeUuid}
+      />
+    );
+  }
+
+  if (actor.actorType === "manager" && actor.employeeUuid) {    const directReportIds = await resolveManagerDirectReportUuids(
+      actor.employeeUuid
+    );
+    const scopedIds = [actor.employeeUuid, ...directReportIds];
+
+    const [employeesResult, proposalCycles] = await Promise.all([
+      supabaseAdmin
+        .from("hr1_employees")
+        .select(
+          "id, first_name, last_name, department, manager_id, job_position_id, job_position:hr1_job_positions(title)"
+        )
+        .in("id", scopedIds)
+        .order("last_name", { ascending: true })
+        .order("first_name", { ascending: true }),
+      loadProposalCycles(),
+    ]);
+
+    const employeeRows = (employeesResult.data ?? []) as unknown as EmployeeRow[];
+    const managerNamesById = await resolveManagerNames(employeeRows);
+
+    const employees: EmployeeOption[] = employeeRows.map((e) =>
+      toEmployeeOption(e, managerNamesById)
+    );
+
+    return (
+      <GoalsManagement
+        serverUser={serverUser}
+        actorType="manager"
+        isPerDevHrAdmin={isPerDevHrAdmin}
+        initialGoals={goals}
+        initialError={initialError}
+        cycles={proposalCycles}
+        employees={employees}
+        cycleNamesById={names.cycleNamesById}
+        employeeNamesById={names.employeeNamesById}
+        defaultCycleId={chooseCurrentCycle(proposalCycles)?.id}
+        departments={[]}
+        actorEmployeeId={actor.employeeUuid}
+      />
+    );
+  }
+
+  const proposalCycles = await loadProposalCycles();
+
+  return (
+    <GoalsManagement
+      serverUser={serverUser}
+      actorType="employee"
+      isPerDevHrAdmin={isPerDevHrAdmin}
+      initialGoals={goals}
+      initialError={initialError}
+      cycles={proposalCycles}
+      employees={[]}
+      cycleNamesById={names.cycleNamesById}
+      employeeNamesById={names.employeeNamesById}
+      defaultCycleId={chooseCurrentCycle(proposalCycles)?.id}
+      departments={[]}
+      actorEmployeeId={actor.employeeUuid}
+      // The employee view also serves edge actors (non-PerDev HR, accounts
+      // without a linked employee). Only genuine employee actors receive the
+      // proposal entry point; the service remains authoritative regardless.
+      canProposeGoal={actor.actorType === "employee"}
+    />
+  );
+}

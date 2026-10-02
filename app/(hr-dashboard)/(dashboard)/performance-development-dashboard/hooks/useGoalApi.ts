@@ -1,0 +1,188 @@
+"use client";
+
+import { useCallback, useState } from "react";
+import type {
+  CreateGoalEvidenceInput,
+  GoalCreateInput,
+  GoalProposalInput,
+  GoalReviewInput,
+  GoalUpdateInput,
+  PerformanceGoal,
+  PerformanceGoalEvidenceItem,
+} from "@/performance-development-dashboard/types";
+import { perDevFetch } from "@/performance-development-dashboard/lib/api/perDevFetch";
+
+const GOALS_API = "/performance-development-dashboard/api/performance/goals";
+
+export function useGoalApi() {
+  const [busy, setBusy] = useState<{ id: string; action: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const request = useCallback(
+    (path: string, method: "GET" | "POST" | "PATCH" = "GET", body?: unknown) =>
+      perDevFetch(path, {
+        method,
+        body,
+        sessionExpiredMessage: "Your session has expired. Please sign in again.",
+      }),
+    []
+  );
+
+  const list = useCallback(
+    (params?: Record<string, string>) => {
+      const url =
+        params && Object.keys(params).length > 0
+          ? `${GOALS_API}?${new URLSearchParams(params).toString()}`
+          : GOALS_API;
+      return request(url) as Promise<PerformanceGoal[]>;
+    },
+    [request]
+  );
+
+  const create = useCallback(
+    (input: GoalCreateInput, params?: Record<string, string>) => {
+      const url =
+        params && Object.keys(params).length > 0
+          ? `${GOALS_API}?${new URLSearchParams(params).toString()}`
+          : GOALS_API;
+      return request(url, "POST", input) as Promise<PerformanceGoal>;
+    },
+    [request]
+  );
+
+  const update = useCallback(
+    (id: string, input: GoalUpdateInput) =>
+      request(`${GOALS_API}/${id}`, "PATCH", input) as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const progress = useCallback(
+    (id: string, input: unknown) =>
+      request(`${GOALS_API}/${id}/progress`, "POST", input) as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const submit = useCallback(
+    (id: string) =>
+      request(`${GOALS_API}/${id}/submit`, "POST") as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const createEvidence = useCallback(
+    (goalId: string, input: CreateGoalEvidenceInput) =>
+      request(
+        `${GOALS_API}/${goalId}/evidence`,
+        "POST",
+        input
+      ) as Promise<PerformanceGoalEvidenceItem>,
+    [request]
+  );
+
+  const listEvidence = useCallback(
+    (goalId: string) =>
+      request(
+        `${GOALS_API}/${goalId}/evidence`
+      ) as Promise<PerformanceGoalEvidenceItem[]>,
+    [request]
+  );
+
+  /**
+   * Employee proposal workflow endpoints (Part 2 backend contract).
+   * Proposal payloads carry definition fields only; ownership, weight,
+   * approval, status, and progress state are server-derived.
+   */
+  const proposeGoal = useCallback(
+    (input: GoalProposalInput) =>
+      request(`${GOALS_API}/proposals`, "POST", input) as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const updateProposal = useCallback(
+    (id: string, input: GoalProposalInput) =>
+      request(
+        `${GOALS_API}/${id}/proposal`,
+        "PATCH",
+        input
+      ) as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const submitProposal = useCallback(
+    (id: string) =>
+      request(
+        `${GOALS_API}/${id}/submit-proposal`,
+        "POST"
+      ) as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const approveProposal = useCallback(
+    (id: string, input: GoalReviewInput) =>
+      request(
+        `${GOALS_API}/${id}/approve-proposal`,
+        "POST",
+        input
+      ) as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const returnProposal = useCallback(
+    (id: string, input: GoalReviewInput) =>
+      request(
+        `${GOALS_API}/${id}/return-proposal`,
+        "POST",
+        input
+      ) as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const rejectProposal = useCallback(
+    (id: string, input: GoalReviewInput) =>
+      request(
+        `${GOALS_API}/${id}/reject-proposal`,
+        "POST",
+        input
+      ) as Promise<PerformanceGoal>,
+    [request]
+  );
+
+  const runAction = useCallback(
+    async <T,>(
+      id: string,
+      action: string,
+      fn: (goalId: string) => Promise<T>
+    ) => {
+      setError(null);
+      setBusy({ id, action });
+      try {
+        return await fn(id);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Unexpected error");
+        throw err;
+      } finally {
+        setBusy(null);
+      }
+    },
+    []
+  );
+
+  return {
+    list,
+    create,
+    update,
+    progress,
+    submit,
+    createEvidence,
+    listEvidence,
+    proposeGoal,
+    updateProposal,
+    submitProposal,
+    approveProposal,
+    returnProposal,
+    rejectProposal,
+    runAction,
+    busy,
+    error,
+    clearError: () => setError(null),
+  };
+}
