@@ -26,7 +26,7 @@ export type ParcelStatus = "PICKED_UP" | "BOOKED" | "IN_TRANSIT" | "DELAYED" | "
 
 export function isTripInTransitStatus(status?: string | null) {
   const normalized = String(status || "").trim().toLowerCase().replace(/[_-]+/g, " ");
-  return /\b(in transit|transit|dispatched|dispatch|delivering|moving|en route|on route)\b/.test(normalized);
+  return /\b(accepted|scheduled|in transit|transit|dispatched|dispatch|delivering|moving|en route|on route)\b/.test(normalized);
 }
 
 export function isOperationalTrip(trip: { id?: string | null; trip_id?: string | null; status?: string | null }) {
