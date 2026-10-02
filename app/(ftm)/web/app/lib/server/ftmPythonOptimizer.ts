@@ -29,6 +29,11 @@ function validateSolverResponse(value: unknown): OptimizeResponse {
 }
 
 async function runBoundPythonService(payload: OptimizeRequest, baseUrl: string): Promise<unknown> {
+  const sharedSecret = process.env.FTM_ORTOOLS_SHARED_SECRET;
+  if (!sharedSecret) {
+    throw optimizerError("The FTM Python optimizer credential is not configured.", 503);
+  }
+
   let endpoint: URL;
   try {
     endpoint = new URL("optimize-route", baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
@@ -40,7 +45,11 @@ async function runBoundPythonService(payload: OptimizeRequest, baseUrl: string):
   try {
     response = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: `Bearer ${sharedSecret}`,
+      },
       body: JSON.stringify(payload),
       cache: "no-store",
       signal: AbortSignal.timeout(INTERNAL_TIMEOUT_MS),
