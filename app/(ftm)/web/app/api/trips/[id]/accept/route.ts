@@ -30,6 +30,7 @@ export async function POST(request: Request, { params }: { params: { id: string 
     }
   }
   update.status = "Scheduled";
+  update.updated_at = new Date().toISOString();
   const { data, error } = await supabase.from("trips").update(update).eq("id", params.id).select("*").maybeSingle();
   if (error) return NextResponse.json({ error: "Failed to accept trip" }, { status: 500 });
   if (!data) return NextResponse.json({ error: "Trip not found" }, { status: 404 });

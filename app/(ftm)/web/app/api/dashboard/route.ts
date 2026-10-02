@@ -19,6 +19,25 @@ type TrackingLocation = {
   source: "mobile_device_tracking" | "driver_tracking";
 };
 
+const DASHBOARD_PAGE_SIZE = 1000;
+
+async function fetchAllPages(
+  loadPage: (from: number, to: number) => PromiseLike<{
+    data: Record<string, any>[] | null;
+    error: { message: string; code?: string } | null;
+  }>,
+) {
+  const rows: Record<string, any>[] = [];
+  for (let from = 0; ; from += DASHBOARD_PAGE_SIZE) {
+    const { data, error } = await loadPage(from, from + DASHBOARD_PAGE_SIZE - 1);
+    if (error) return { data: null, error };
+    const page = data || [];
+    rows.push(...page);
+    if (page.length < DASHBOARD_PAGE_SIZE) break;
+  }
+  return { data: rows, error: null };
+}
+
 function normalizeLocation(row: Record<string, any>, source: TrackingLocation["source"]): TrackingLocation | null {
   if (row.is_mock_location === true || row.is_mock_location === "true" || row.is_mock_location === 1) return null;
   if (/^(inactive|invalid|rejected|offline|stopped)$/i.test(String(row.status || "").trim())) return null;
@@ -90,21 +109,23 @@ export async function GET(request: Request) {
   const parcelsSupabase = createFtmParcelClient() || supabase;
 
   try {
-    const [vehiclesResult, tripsResult, bookingsResult, parcelsResult, routePlansResult, initialDriversResult] = await Promise.all([
-      supabase.from("vehicles").select("*").order("created_at", { ascending: false }).limit(1000),
-      supabase.from("trips").select("*").order("created_at", { ascending: false }).limit(1000),
-      supabase.from("bookings").select("*").order("created_at", { ascending: false }).limit(1000),
-      parcelsSupabase.from("parcels").select("*").order("created_at", { ascending: false }).limit(1000),
-      supabase.from("route_plans").select("*").order("created_at", { ascending: false }).limit(1000),
-      supabase.from("users").select("id,email,full_name,avatar_url,role,phone,created_at,updated_at").eq("role", "driver").order("full_name", { ascending: true }).limit(1000),
+    const [vehiclesResult, tripsResult, bookingsResult, parcelsResult, routePlansResult, initialDriversResult, fuelLogsResult, costEntriesResult] = await Promise.all([
+      fetchAllPages((from, to) => supabase.from("vehicles").select("*").order("created_at", { ascending: false }).range(from, to)),
+      fetchAllPages((from, to) => supabase.from("trips").select("*").order("created_at", { ascending: false }).range(from, to)),
+      fetchAllPages((from, to) => supabase.from("bookings").select("*").order("created_at", { ascending: false }).range(from, to)),
+      fetchAllPages((from, to) => parcelsSupabase.from("parcels").select("*").order("created_at", { ascending: false }).range(from, to)),
+      fetchAllPages((from, to) => supabase.from("route_plans").select("*").order("created_at", { ascending: false }).range(from, to)),
+      fetchAllPages((from, to) => supabase.from("users").select("id,email,full_name,avatar_url,role,phone,created_at,updated_at").eq("role", "driver").order("full_name", { ascending: true }).range(from, to)),
+      fetchAllPages((from, to) => supabase.from("fuel_logs").select("*").order("logged_at", { ascending: false }).range(from, to)),
+      fetchAllPages((from, to) => supabase.from("cost_entries").select("*").order("entry_date", { ascending: false }).range(from, to)),
     ]);
 
     let driversResult: { data: Record<string, any>[] | null; error: { message: string; code?: string } | null } = initialDriversResult;
     if (driversResult.error && /avatar_url.*does not exist|column.*avatar_url/i.test(driversResult.error.message)) {
-      driversResult = await supabase.from("users").select("id,email,full_name,role,phone,created_at,updated_at").eq("role", "driver").order("full_name", { ascending: true }).limit(1000);
+      driversResult = await fetchAllPages((from, to) => supabase.from("users").select("id,email,full_name,role,phone,created_at,updated_at").eq("role", "driver").order("full_name", { ascending: true }).range(from, to));
     }
 
-    const coreError = vehiclesResult.error || tripsResult.error || bookingsResult.error || routePlansResult.error;
+    const coreError = vehiclesResult.error || tripsResult.error || bookingsResult.error || parcelsResult.error || routePlansResult.error || fuelLogsResult.error || costEntriesResult.error;
     if (coreError) {
       if (/relationship|schema cache|Could not find the table|Could not find a relationship/i.test(coreError.message) || ["PGRST002", "42501", "PGRST303"].includes(coreError.code || "")) {
         return NextResponse.json({ error: "Dashboard data sources are unavailable; no live fleet snapshot can be shown." }, { status: 503 });
@@ -113,7 +134,7 @@ export async function GET(request: Request) {
     }
 
     const routePlans = (routePlansResult.data || []).map(normalizeRoutePlan);
-    const routePlanById = new Map(routePlans.map((routePlan) => [String(routePlan.id), routePlan]));
+    const routePlanById = new Map<string, any>(routePlans.map((routePlan: any) => [String(routePlan.id), routePlan]));
     const bookings = (bookingsResult.data || []).map((booking) => ({
       ...booking,
       parcel_ids: Array.isArray(booking.parcel_ids)
@@ -121,7 +142,7 @@ export async function GET(request: Request) {
         : String(booking.cargo_description || "").match(/parcel_ids=([^;\s]+)/i)?.[1]?.split(",").map((id: string) => id.trim()).filter(Boolean) || [],
       routePlan: booking.route_plan_id ? routePlanById.get(String(booking.route_plan_id)) || null : null,
     }));
-    const bookingById = new Map(bookings.map((booking) => [String(booking.id), booking]));
+    const bookingById = new Map<string, any>(bookings.map((booking) => [String(booking.id), booking]));
     const driverRows = driversResult.data || [];
     const driverIds = driverRows.map((driver) => driver.id);
     const vehicleRows = vehiclesResult.data || [];
@@ -245,7 +266,22 @@ export async function GET(request: Request) {
         proofOfDelivery: proofByTrip.get(String(trip.id)) || null,
       };
     });
-    const parcels = parcelsResult.error ? [] : parcelsResult.data || [];
+    const parcels = parcelsResult.data || [];
+    const fuelLogs = (fuelLogsResult.data || []).map((log) => ({
+      id: log.id,
+      vehicleId: log.vehicle_id ?? log.vehicleId,
+      driverId: log.driver_id ?? log.driverId,
+      tripId: log.trip_id ?? log.tripId,
+      liters: Number(log.liters ?? 0),
+      cost: Number(log.cost ?? 0),
+      loggedAt: log.logged_at ?? log.loggedAt,
+    }));
+    const costEntries = (costEntriesResult.data || []).map((entry) => ({
+      ...entry,
+      amount: Number(entry.amount ?? entry.cost ?? 0),
+      category: entry.category || "Other",
+      entryDate: entry.entry_date ?? entry.entryDate ?? entry.created_at,
+    }));
 
     const deployments = trips.filter((trip) => {
       const activeTrip = activeTripByVehicle.get(String(trip.vehicle_id || ""));
@@ -296,6 +332,8 @@ export async function GET(request: Request) {
       trips,
       bookings,
       parcels,
+      fuelLogs,
+      costEntries,
       drivers,
       routePlans,
       routePlanBookings: [],

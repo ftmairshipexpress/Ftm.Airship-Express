@@ -63,6 +63,22 @@ const isActiveTripStatus = (status?: string | null) => {
   return isOperationalTrip({ id: status ? "status" : null, status });
 };
 
+const isDriverAcceptedTripStatus = (status?: string | null) => {
+  const normalized = String(status || "").trim().toLowerCase().replace(/[_-]+/g, " ");
+  return ["accepted", "scheduled", "pickup confirmed", "in transit", "delivering", "en route", "moving"].includes(normalized);
+};
+
+function hasFreshDeviceLocation(trip: DashboardTrip, now: number) {
+  const currentLocation = (trip as any).currentLocation;
+  const position = validCoordinates(
+    currentLocation?.lat ?? (trip as any).locationLat,
+    currentLocation?.lng ?? (trip as any).locationLng,
+  );
+  const recordedAt = currentLocation?.recorded_at || (trip as any).locationRecordedAt;
+  const recordedAtMs = recordedAt ? Date.parse(String(recordedAt)) : NaN;
+  return Boolean(position) && Number.isFinite(recordedAtMs) && recordedAtMs <= now + 5 * 60_000 && now - recordedAtMs <= 5 * 60_000;
+}
+
 export default function MapSection({ 
   trips, 
   vehicles, 
@@ -140,7 +156,8 @@ export default function MapSection({
   const activeTrips = useMemo(
     () => {
       const newestByVehicle = new Map<string, DashboardTrip>();
-      uniqueTrips.filter((trip) => isActiveTripStatus(trip.status)).forEach((trip) => {
+      const now = Date.now();
+      uniqueTrips.filter((trip) => isActiveTripStatus(trip.status) && isDriverAcceptedTripStatus(trip.status) && hasFreshDeviceLocation(trip, now)).forEach((trip) => {
         const vehicleId = String(trip.vehicleId || trip.vehicle_id || "");
         if (!vehicleId || !vehicles.some((vehicle) => String(vehicle.id || "") === vehicleId)) return;
         const current = newestByVehicle.get(vehicleId);

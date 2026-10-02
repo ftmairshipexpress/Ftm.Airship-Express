@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import GlobalNavbar from "../components/GlobalNavbar";
 import GlobalFooter from "../components/GlobalFooter";
-import { fetchJson, getFuelLogs, getCostEntries } from "../lib/api";
+import { fetchJson } from "../lib/api";
 import SpecializedLogistics from "./components/SpecializedLogistics";
 import PerformanceMetrics from "./components/PerformanceMetrics";
 import MissionLogs from "./components/MissionLogs";
@@ -416,6 +416,8 @@ export default function Home() {
           drivers: Array.isArray(data.drivers) ? data.drivers : [],
         });
         setParcels(Array.isArray(data.parcels) ? data.parcels : []);
+        setFuelLogs(Array.isArray(data.fuelLogs) ? data.fuelLogs : []);
+        setCostEntries(Array.isArray(data.costEntries) ? data.costEntries : []);
         setError(null);
       } catch (requestError) {
         console.error("Failed to load dashboard data:", requestError);
@@ -426,19 +428,7 @@ export default function Home() {
       }
     };
 
-    const loadAnalytics = async () => {
-      try {
-        const [fuelData, costData] = await Promise.all([getFuelLogs(), getCostEntries()]);
-        if (!active) return;
-        setFuelLogs(Array.isArray(fuelData) ? fuelData : []);
-        setCostEntries(Array.isArray(costData) ? costData : []);
-      } catch (analyticsError) {
-        console.warn("Dashboard analytics data is unavailable:", analyticsError);
-      }
-    };
-
     void loadSnapshot();
-    void loadAnalytics();
     const intervalId = window.setInterval(() => void loadSnapshot(), 30_000);
     const handleVisibility = () => {
       if (document.visibilityState === "visible") void loadSnapshot();
