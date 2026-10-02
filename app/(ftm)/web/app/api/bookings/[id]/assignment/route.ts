@@ -66,12 +66,15 @@ async function syncAssignedTrip(supabase: SupabaseClient, booking: Record<string
     ? supabase.from("trips").update(payload).eq("id", existing.id).select("id").single()
     : supabase.from("trips").insert(payload).select("id").single();
   let result = await persist(trip);
-  if (result.error && /column .* does not exist|schema cache|from_latitude|to_latitude/i.test(result.error.message)) {
+  if (result.error && /column .* does not exist|schema cache|from_location|to_location|from_latitude|from_longitude|to_latitude|to_longitude|load_kg/i.test(result.error.message)) {
     const legacy = { ...trip } as Record<string, unknown>;
+    delete legacy.from_location;
+    delete legacy.to_location;
     delete legacy.from_latitude;
     delete legacy.from_longitude;
     delete legacy.to_latitude;
     delete legacy.to_longitude;
+    delete legacy.load_kg;
     result = await persist(legacy);
   }
   if (result.error) {
