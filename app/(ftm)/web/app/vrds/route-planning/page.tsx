@@ -223,6 +223,12 @@ function calculateFuelSavingsPct(baselineDistanceMi: number | null, routeDistanc
   return ((baselineDistanceMi - routeDistanceMi) / baselineDistanceMi) * 100;
 }
 
+function compactRoutePolyline(points: LatLng[], maxPoints = 1000): LatLng[] {
+  if (points.length <= maxPoints) return points;
+  const lastIndex = points.length - 1;
+  return Array.from({ length: maxPoints }, (_, index) => points[Math.round(index * lastIndex / (maxPoints - 1))]);
+}
+
 function calculateEtaMinutes(distanceMi: number | null) {
   if (distanceMi === null || !Number.isFinite(distanceMi) || distanceMi <= 0) return null;
   return Math.max(1, Math.round((distanceMi / 32) * 60));
@@ -1543,7 +1549,21 @@ export default function VrdsRoutePlanningPage() {
           destination,
           orderedIds: orderedStopIds,
         });
-        const routePolyline = optimizedResult.polyline?.length ? optimizedResult.polyline : fallbackPolyline;
+        const routePolyline = compactRoutePolyline(optimizedResult.polyline?.length ? optimizedResult.polyline : fallbackPolyline);
+        const persistedOptimizedRoute = optimizedResult.optimizedRoute
+          ? { ...optimizedResult.optimizedRoute, polyline: undefined }
+          : null;
+        const persistedOptimizationResult = {
+          ...optimizedResult,
+          polyline: undefined,
+          routes: optimizedResult.routes?.map(({ vehicleId, orderedStopIds, distanceMi, etaMinutes }) => ({
+            vehicleId,
+            orderedStopIds,
+            distanceMi,
+            etaMinutes,
+          })),
+          optimizedRoute: persistedOptimizedRoute,
+        };
         const routePlanKey = `${courier}-${parcelIds.map(String).sort().join("-")}`;
         const plannedVehicle = availableVehicleOptions.find((vehicle) => vehicle.id === optimizedResult.vehicleId) || null;
         const routePlan = await createRoutePlan({
@@ -1568,7 +1588,7 @@ export default function VrdsRoutePlanningPage() {
             }).filter(Boolean),
           },
           baseline_route: optimizedResult.baselineRoute,
-          optimized_route: optimizedResult.optimizedRoute,
+          optimized_route: persistedOptimizedRoute,
           baseline_distance_km: optimizedResult.baselineDistanceMi == null ? null : optimizedResult.baselineDistanceMi * 1.609344,
           baseline_duration_min: optimizedResult.baselineEtaMinutes ?? null,
           optimized_distance_km: optimizedResult.distanceMi * 1.609344,
@@ -1589,7 +1609,7 @@ export default function VrdsRoutePlanningPage() {
           } : null,
           driver_id: null,
           driver_info: null,
-          optimization_result: optimizedResult,
+          optimization_result: persistedOptimizationResult,
           route_geojson: {
             type: "FeatureCollection",
             features: [{
