@@ -70,7 +70,15 @@ export async function authenticateFtmRequest(request: Request) {
     return {
       context: {
         serviceClient,
-        user: { id: user.id, email: user.email, role, user_metadata: user.user_metadata || {} },
+        user: {
+          id: user.id,
+          email: user.email,
+          role,
+          user_metadata: user.user_metadata || {},
+          created_at: user.created_at,
+          last_sign_in_at: user.last_sign_in_at,
+          email_confirmed_at: user.email_confirmed_at,
+        },
         profile,
       },
     };

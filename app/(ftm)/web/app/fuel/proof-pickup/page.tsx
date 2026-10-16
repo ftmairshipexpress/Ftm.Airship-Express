@@ -7,52 +7,82 @@ import GlobalFooter from "../../components/GlobalFooter";
 
 type PickupEntry = {
   id: string;
+  tripId: string;
   vehicle: string;
   driver: string;
   date: string;
   location: string;
   note: string;
-  image?: string;
+  image: string;
 };
 
-const pickupEntries: PickupEntry[] = [];
+type DataRecord = Record<string, any>;
+
+function firstValue(...values: unknown[]) {
+  return values.find((value) => value != null && String(value).trim() !== "") ?? null;
+}
 
 export default function ProofPickupPage() {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<PickupEntry | null>(null);
+  const [entries, setEntries] = useState<PickupEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const filteredEntries = useMemo(() => {
     const q = search.toLowerCase();
-    return pickupEntries.filter((entry) => {
+    return entries.filter((entry) => {
       return (
         entry.vehicle.toLowerCase().includes(q) ||
         entry.driver.toLowerCase().includes(q) ||
         entry.location.toLowerCase().includes(q) ||
-        entry.note.toLowerCase().includes(q)
+        entry.note.toLowerCase().includes(q) ||
+        entry.tripId.toLowerCase().includes(q)
       );
     });
-  }, [search]);
-
-  const [hasData, setHasData] = useState<boolean | null>(null);
+  }, [entries, search]);
 
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
         const dash = await getDashboardSnapshot();
-        const logs = dash.fuelLogs || [];
-        if (mounted) setHasData(Boolean(logs.length));
-      } catch (e) {
-        console.warn('Failed to load fuel snapshot', e);
-        if (mounted) setHasData(false);
+        const vehicles = Array.isArray(dash.vehicles) ? dash.vehicles as DataRecord[] : [];
+        const drivers = Array.isArray(dash.drivers) ? dash.drivers as DataRecord[] : [];
+        const vehicleById = new Map(vehicles.map((vehicle) => [String(vehicle.id ?? vehicle.vehicle_id), vehicle]));
+        const driverById = new Map(drivers.map((driver) => [String(driver.id), driver]));
+        const trips = Array.isArray(dash.trips) ? dash.trips as DataRecord[] : [];
+        const pickupEntries = trips.flatMap((trip): PickupEntry[] => {
+          const proofUrl = firstValue(trip.pickup_proof_url, trip.pickupProofUrl);
+          if (!proofUrl) return [];
+          const vehicleId = String(firstValue(trip.vehicle_id, trip.vehicleId) || "");
+          const driverId = String(firstValue(trip.driver_id, trip.driverId) || "");
+          const vehicle = vehicleById.get(vehicleId);
+          const driver = driverById.get(driverId);
+          const date = firstValue(trip.pickup_confirmed_at, trip.pickupConfirmedAt, trip.actual_departure, trip.actualDeparture, trip.created_at, trip.createdAt);
+          const location = firstValue(trip.from_location, trip.fromLocation, trip.routePlan?.pickupLocation, trip.bookings?.pickup_location);
+          return [{
+            id: String(firstValue(trip.id, trip.trip_id) || "Trip"),
+            tripId: String(firstValue(trip.id, trip.trip_id) || "Not recorded"),
+            vehicle: String(firstValue(vehicle?.plate_number, vehicle?.plateNumber, vehicleId) || "Vehicle unavailable"),
+            driver: String(firstValue(driver?.full_name, driver?.name, trip.driverName, trip.driver_name) || "Driver unavailable"),
+            date: date == null ? "" : String(date),
+            location: String(location || "Location not recorded"),
+            note: String(firstValue(trip.pickup_remarks, trip.pickupRemarks, trip.pickup_status, trip.pickupStatus) || "Pickup proof attached"),
+            image: String(proofUrl),
+          }];
+        });
+        if (mounted) { setEntries(pickupEntries); setLoadError(null); }
+      } catch (error) {
+        if (mounted) setLoadError(error instanceof Error ? error.message.replace(/^Request failed \d+: /, "") : "Pickup proof records could not be loaded.");
+      } finally {
+        if (mounted) setLoading(false);
       }
     })();
     return () => { mounted = false; };
   }, []);
 
-  // Keep page visible; individual items will show placeholders if no fuel logs.
-
-  const visibleEntries = hasData ? filteredEntries : [];
+  const visibleEntries = filteredEntries;
 
   return (
     <div className="min-h-screen bg-[#fff7fc] text-slate-900">
@@ -70,10 +100,12 @@ export default function ProofPickupPage() {
             </div>
 
             <div className="rounded-2xl bg-pink-50 px-4 py-3 text-sm font-semibold text-pink-700 ring-1 ring-pink-200">
-              {hasData ? `${visibleEntries.length} pickup proofs` : "—"}
+              {loading ? "Loading proofs…" : `${visibleEntries.length} pickup proofs`}
             </div>
           </div>
         </header>
+
+        {loadError && <div role="alert" className="flex flex-col gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 sm:flex-row sm:items-center sm:justify-between"><span>Pickup proofs could not be loaded: {loadError}</span><button type="button" onClick={() => window.location.reload()} className="rounded-md border border-rose-300 bg-white px-2.5 py-1.5 text-[10px] font-bold hover:bg-rose-100">Retry</button></div>}
 
         <section className="rounded-3xl border border-pink-100 bg-white p-4 shadow-sm sm:p-5">
           <div className="relative">
@@ -106,7 +138,7 @@ export default function ProofPickupPage() {
                     <h2 className="mt-1 text-lg font-extrabold text-slate-900">{entry.vehicle}</h2>
                   </div>
                   <span className="rounded-full bg-pink-50 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-pink-700 ring-1 ring-pink-100">
-                    {new Date(entry.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                    {entry.date ? new Date(entry.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "Not recorded"}
                   </span>
                 </div>
 
@@ -124,6 +156,8 @@ export default function ProofPickupPage() {
               </div>
             </article>
           ))}
+          {loading && <div className="col-span-full rounded-xl border border-slate-200 bg-white px-4 py-12 text-center text-sm text-slate-500">Loading pickup proof records…</div>}
+          {!loading && !loadError && visibleEntries.length === 0 && <div className="col-span-full rounded-xl border border-dashed border-pink-200 bg-white px-4 py-12 text-center"><p className="text-sm font-semibold text-slate-700">No pickup proof records available</p><p className="mt-1 text-xs text-slate-500">Trips appear here when a pickup proof URL has been recorded.</p></div>}
         </section>
       </main>
 
@@ -151,7 +185,7 @@ export default function ProofPickupPage() {
                 <div className="grid gap-3 text-sm text-slate-600">
                   <p><span className="font-semibold text-slate-700">Driver:</span> {selected.driver}</p>
                   <p><span className="font-semibold text-slate-700">Location:</span> {selected.location}</p>
-                  <p><span className="font-semibold text-slate-700">Date:</span> {new Date(selected.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</p>
+                  <p><span className="font-semibold text-slate-700">Date:</span> {selected.date ? new Date(selected.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "Not recorded"}</p>
                 </div>
 
                 <div className="rounded-2xl bg-slate-50 p-3 text-sm text-slate-700">{selected.note}</div>

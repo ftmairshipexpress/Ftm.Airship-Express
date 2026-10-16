@@ -45,7 +45,7 @@ export default function VrdsHistoryPage() {
     setLoading(true);
     setLoadError(null);
 
-    getTrips()
+    getTrips({ all: true, light: true })
       .then((trips) => {
         if (!active) return;
         setHistory((trips || []).map(mapTripToHistory));

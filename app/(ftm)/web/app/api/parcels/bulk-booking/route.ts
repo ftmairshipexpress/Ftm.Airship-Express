@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { hasPermission } from "../../../lib/permissions";
 import { authenticateFtmRequest } from "../../../lib/server/ftmRequestAuth";
 import { createFtmParcelClient } from "../../../lib/server/ftmSupabase";
+import { AIRSHIP_COURIER_NAME, belongsToAirshipCourier, getAirshipCouriers, isAirshipCourier } from "../../../lib/server/ftmCourier";
 
 export const dynamic = "force-dynamic";
 
@@ -19,10 +20,16 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "A valid JSON request body is required." }, { status: 400 });
   }
-  const courier = body.courier;
+  const requestedCourier = body.courier;
+  if (requestedCourier && !isAirshipCourier(requestedCourier)) return NextResponse.json({ error: "Bulk bookings can only be created for Airship Express." }, { status: 400 });
   const requestedIds = Array.isArray(body.parcel_ids) ? body.parcel_ids : [];
   const routePlanId = body.route_plan_id || null;
-  if (!courier) return NextResponse.json({ error: "courier is required" }, { status: 400 });
+  let airshipCourier;
+  try { airshipCourier = (await getAirshipCouriers(context.serviceClient))[0]; } catch (error) {
+    return NextResponse.json({ error: "Unable to resolve Airship Express courier.", details: error instanceof Error ? error.message : String(error) }, { status: 500 });
+  }
+  if (!airshipCourier) return NextResponse.json({ error: "No active Airship Express courier is registered." }, { status: 409 });
+  const courier = AIRSHIP_COURIER_NAME;
 
   const parcelsSupabase = createFtmParcelClient();
   const bookingsSupabase = context.serviceClient;
@@ -41,14 +48,15 @@ export async function POST(request: Request) {
   if (!persistedRoutePlanId) {
     return NextResponse.json({ error: "A persisted route_plan_id is required before creating its booking." }, { status: 400 });
   }
-  if (routePlan.courier && routePlan.courier !== courier) {
+  if (!belongsToAirshipCourier(routePlan, new Set([airshipCourier.id]))) {
     return NextResponse.json({ error: "That route plan does not belong to the selected courier" }, { status: 400 });
   }
 
   let parcelQuery = parcelsSupabase.from("parcels").select("*");
   parcelQuery = requestedIds.length ? parcelQuery.in("id", requestedIds) : parcelQuery.eq("courier", courier);
-  const { data: parcels, error: parcelError } = await parcelQuery;
+  const { data: parcelRows, error: parcelError } = await parcelQuery;
   if (parcelError) return NextResponse.json({ error: `Unable to load parcels: ${parcelError.message}` }, { status: 500 });
+  const parcels = (parcelRows || []).filter((parcel) => belongsToAirshipCourier(parcel, new Set([airshipCourier.id])));
   if (!parcels?.length) return NextResponse.json({ error: `No pending parcels found for courier "${courier}"` }, { status: 400 });
 
   const totalWeight = parcels.reduce((sum, parcel) => sum + Number(parcel.weight_kg || parcel.weight || 0), 0);
@@ -70,6 +78,7 @@ export async function POST(request: Request) {
     id: bookingId,
     idempotency_key: bookingIdempotencyKey,
     courier,
+    courier_id: airshipCourier.id,
     route_plan_id: linkedRoutePlanId,
     delivery_destinations: destinations,
     pickup_location: routePlan.pickup_location,

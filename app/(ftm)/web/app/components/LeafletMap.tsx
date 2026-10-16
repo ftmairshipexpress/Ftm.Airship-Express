@@ -35,11 +35,14 @@ interface LeafletMapProps {
   directionPath?: LatLng[][];
   initialPath?: LatLng[] | null;
   optimizedPath?: LatLng[] | null;
+  focusKey?: string | null;
+  focusPoints?: LatLng[];
   routeColor?: string;
-  coloredPaths?: Array<{ points: LatLng[]; color: string; label?: string }>;
+  coloredPaths?: Array<{ points: LatLng[]; color: string; label?: string; dashArray?: string }>;
   onlyColoredPaths?: boolean;
   className?: string;
   onMarkerClick?: (marker: LeafletMarker) => void;
+  onMapClick?: (position: LatLng) => void;
 }
 
 /**
@@ -84,11 +87,14 @@ export default function LeafletMap({
   directionPath = [],
   initialPath,
   optimizedPath,
+  focusKey,
+  focusPoints = [],
   routeColor = "#b80049",
   coloredPaths = [],
   onlyColoredPaths = false,
   className = "w-full h-full min-h-[420px] rounded-2xl overflow-hidden shadow-inner border border-slate-200",
   onMarkerClick,
+  onMapClick,
 }: LeafletMapProps) {
   const PHILIPPINES_BOUNDS = L.latLngBounds(
     [4.5, 116.0],
@@ -98,14 +104,36 @@ export default function LeafletMap({
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersLayerGroupRef = useRef<L.LayerGroup | null>(null);
   const routesLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const markerInstancesRef = useRef(new Map<string, L.Marker>());
+  const markerIconsRef = useRef(new Map<string, string>());
+  const markerPopupsRef = useRef(new Map<string, string>());
+  const focusedKeyRef = useRef<string | null>(null);
+  const focusPointsRef = useRef(focusPoints);
   const [mapReady, setMapReady] = useState(false);
+  const onMapClickRef = useRef(onMapClick);
+  const onMarkerClickRef = useRef(onMarkerClick);
+
+  useEffect(() => {
+    onMapClickRef.current = onMapClick;
+  }, [onMapClick]);
+
+  useEffect(() => {
+    onMarkerClickRef.current = onMarkerClick;
+  }, [onMarkerClick]);
+
+  useEffect(() => {
+    focusPointsRef.current = focusPoints;
+  }, [focusPoints]);
 
   // Initialize Leaflet Map instance
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
+    const markerInstances = markerInstancesRef.current;
+    const markerIcons = markerIconsRef.current;
+    const markerPopups = markerPopupsRef.current;
 
     const map = L.map(mapContainerRef.current, {
-      zoomControl: true,
+      zoomControl: false,
       fadeAnimation: true,
       markerZoomAnimation: true,
       scrollWheelZoom: true,
@@ -143,9 +171,39 @@ export default function LeafletMap({
     return () => {
       map.remove();
       mapInstanceRef.current = null;
+      markerInstances.clear();
+      markerIcons.clear();
+      markerPopups.clear();
       setMapReady(false);
     };
   }, []);
+
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map || !mapReady || !onMapClick) return;
+    const handleClick = (event: L.LeafletMouseEvent) => {
+      onMapClickRef.current?.({ lat: event.latlng.lat, lng: event.latlng.lng });
+    };
+    map.on("click", handleClick);
+    return () => { map.off("click", handleClick); };
+  }, [mapReady, onMapClick]);
+
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map || !mapReady || !focusKey || focusedKeyRef.current === focusKey) return;
+    const points = focusPointsRef.current.filter((point) => Number.isFinite(point.lat) && Number.isFinite(point.lng));
+    if (!points.length) return;
+    focusedKeyRef.current = focusKey;
+    if (points.length === 1) {
+      map.flyTo([points[0].lat, points[0].lng], Math.max(map.getZoom(), 14), { duration: 0.9 });
+      return;
+    }
+    map.flyToBounds(L.latLngBounds(points.map((point) => [point.lat, point.lng] as [number, number])), {
+      padding: [56, 56],
+      maxZoom: 14,
+      duration: 0.9,
+    });
+  }, [focusKey, mapReady]);
 
   useEffect(() => {
     const map = mapInstanceRef.current;
@@ -155,34 +213,43 @@ export default function LeafletMap({
     // User controls view manually
   }, [center, zoom]);
 
-  // Update Markers with Glow and Blink Animations
+  // Update existing markers in place so live GPS fixes move smoothly.
   useEffect(() => {
-    const map = mapInstanceRef.current;
     const layerGroup = markersLayerGroupRef.current;
-    if (!map || !layerGroup) return;
+    if (!mapInstanceRef.current || !layerGroup) return;
 
-    layerGroup.clearLayers();
-
-    if (markers.length === 0) return;
-
-    const bounds = L.latLngBounds([]);
+    const activeIds = new Set<string>();
 
     markers.forEach((m) => {
       if (!m.position || !Number.isFinite(m.position.lat) || !Number.isFinite(m.position.lng)) return;
 
       const latLng: [number, number] = [m.position.lat, m.position.lng];
-      bounds.extend(latLng);
-
       const color = m.color || "#3b82f6";
-      const icon = createGlowingIcon(color, m.label, m.isVehicle);
-
-      const marker = L.marker(latLng, { icon });
-
+      const labelKey = typeof m.label === "string" || typeof m.label === "number" ? String(m.label) : "";
+      const iconKey = `${color}:${labelKey}:${Boolean(m.isVehicle)}`;
       const popupText = typeof m.label === "string"
         ? m.label
         : m.meta?.title || m.meta?.subtitle || "Mission";
+      let marker = markerInstancesRef.current.get(m.id);
 
-      if (popupText) {
+      if (!marker) {
+        marker = L.marker(latLng, { icon: createGlowingIcon(color, m.label, m.isVehicle) }).addTo(layerGroup);
+        markerInstancesRef.current.set(m.id, marker);
+        markerIconsRef.current.set(m.id, iconKey);
+        marker.getElement()?.style.setProperty("transition", "transform 1s linear");
+      } else {
+        const currentPosition = marker.getLatLng();
+        if (currentPosition.lat !== latLng[0] || currentPosition.lng !== latLng[1]) marker.setLatLng(latLng);
+        marker.getElement()?.style.setProperty("transition", "transform 1s linear");
+        if (markerIconsRef.current.get(m.id) !== iconKey) {
+          marker.setIcon(createGlowingIcon(color, m.label, m.isVehicle));
+          markerIconsRef.current.set(m.id, iconKey);
+          marker.getElement()?.style.setProperty("transition", "transform 1s linear");
+        }
+      }
+      activeIds.add(m.id);
+
+      if (popupText && markerPopupsRef.current.get(m.id) !== popupText) {
         marker.bindPopup(`
           <div class="px-1 py-0.5 text-xs font-semibold text-slate-800">
             ${popupText}
@@ -191,24 +258,20 @@ export default function LeafletMap({
           offset: L.point(0, -10),
           className: "animated-popup"
         });
+        markerPopupsRef.current.set(m.id, popupText);
       }
 
-      if (onMarkerClick) {
-        marker.on("click", () => onMarkerClick(m));
-      }
-
-      marker.addTo(layerGroup);
+      marker.off("click");
+      marker.on("click", () => onMarkerClickRef.current?.(m));
     });
 
-    // Don't auto-fit to markers - user controls zoom manually
-    // if (bounds.isValid()) {
-    //   map.flyToBounds(bounds, {
-    //     padding: [50, 50],
-    //     maxZoom: 14,
-    //     duration: 1.2,
-    //     easeLinearity: 0.25,
-    //   });
-    // }
+    markerInstancesRef.current.forEach((marker, id) => {
+      if (activeIds.has(id)) return;
+      layerGroup.removeLayer(marker);
+      markerInstancesRef.current.delete(id);
+      markerIconsRef.current.delete(id);
+      markerPopupsRef.current.delete(id);
+    });
   }, [markers, onMarkerClick]);
 
   // Render Polylines with Flowing Animations and Glowing Halos
@@ -259,13 +322,13 @@ export default function LeafletMap({
     }
 
     if (coloredPaths.length > 0) {
-      coloredPaths.forEach(({ points, color }) => {
+      coloredPaths.forEach(({ points, color, dashArray }) => {
         const latLngs = points.map((pt) => [pt.lat, pt.lng] as [number, number]);
         if (latLngs.length > 1) {
           const glowHalo = L.polyline(latLngs, {
             color: color,
             weight: 10,
-            opacity: 0.35,
+            opacity: dashArray ? 0.12 : 0.35,
             lineCap: "round",
             lineJoin: "round",
             className: "glow-path-layer",
@@ -277,18 +340,19 @@ export default function LeafletMap({
             opacity: 0.9,
             lineCap: "round",
             lineJoin: "round",
-          });
-
-          const flowingDash = L.polyline(latLngs, {
-            color: "#ffffff",
-            weight: 2,
-            opacity: 0.95,
-            className: "animated-route-flow",
+            dashArray,
           });
 
           glowHalo.addTo(layerGroup);
           mainLine.addTo(layerGroup);
-          flowingDash.addTo(layerGroup);
+          if (!dashArray) {
+            L.polyline(latLngs, {
+              color: "#ffffff",
+              weight: 2,
+              opacity: 0.95,
+              className: "animated-route-flow",
+            }).addTo(layerGroup);
+          }
         }
       });
       return;

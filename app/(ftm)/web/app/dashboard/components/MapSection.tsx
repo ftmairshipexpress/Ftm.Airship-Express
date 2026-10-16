@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { createPortal } from "react-dom";
+import { Activity, Clock3, Crosshair, MapPin, Package, Route, Truck, UserRound } from "lucide-react";
 import type { DashboardTrip, DashboardVehicle, DashboardBooking } from "../page";
 import type { LeafletMarker } from "../../components/LeafletMap";
 import { isCompletedTripStatus, isOperationalTrip, isTripInTransitStatus } from "../../lib/parcelTypes";
@@ -14,7 +15,6 @@ const LeafletMap = dynamic(() => import("../../components/LeafletMap"), {
 });
 
 type LatLng = { lat: number; lng: number };
-
 function validCoordinates(lat: unknown, lng: unknown): LatLng | null {
   if (lat == null || lng == null || String(lat).trim() === "" || String(lng).trim() === "") return null;
   const latitude = Number(lat);
@@ -27,24 +27,33 @@ type Delivery = {
   id: string;
   name: string;
   driverName: string;
-  vehiclePlate: string;
+  vehiclePlate: string | null;
+  etaMinutes: number | null;
   parcelSummary: string;
   parcelCount: number;
+  parcelReference: string | null;
+  recipientName: string | null;
   parcelDetails: string[];
   origin: string;
   destination: string;
   originPos: LatLng | null;
   destPos: LatLng | null;
   currentPos: LatLng | null;
-  progress: number;
-  etaMinutes: number | null;
+  locationIsFresh: boolean;
   status: string;
   bookingId: string;
   courier?: string;
-  stops?: { name: string; lat: number; lng: number; status?: string }[];
-  routePlanPolyline?: LatLng[] | null;
   vehicleId: string;
   locationRecordedAt: string | null;
+  stops: Array<{ name: string; lat: number; lng: number; status?: string | null }>;
+  routePlanPolyline?: LatLng[] | null;
+  routeWaypoints?: LatLng[];
+  routeCoordinatesComplete?: boolean;
+  isSavedPlan?: boolean;
+  routePlanId?: string | null;
+  routePlanName?: string | null;
+  routeStarted?: boolean;
+  progress?: number | null;
 };
 
 function normalizeRoutePlanPolyline(value: any): LatLng[] | null {
@@ -59,17 +68,54 @@ function normalizeRoutePlanPolyline(value: any): LatLng[] | null {
   return points.length > 1 ? points : null;
 }
 
+function pointFromRouteRecord(record: any): LatLng | null {
+  if (!record) return null;
+  const lat = record.lat ?? record.latitude ?? record.location?.lat ?? record.location?.latitude;
+  const lng = record.lng ?? record.longitude ?? record.location?.lng ?? record.location?.longitude;
+  return validCoordinates(lat, lng);
+}
+
+function resolveTripStops(trip: DashboardTrip, booking?: DashboardBooking, routePlan?: any): Array<{ name?: string | null; label?: string | null; lat?: number | null; lng?: number | null; latitude?: number | null; longitude?: number | null; status?: string | null }> {
+  const explicitStops = Array.isArray(trip.stops) ? trip.stops : [];
+  const planStops = Array.isArray(routePlan?.stops) ? routePlan.stops : [];
+  const bookingStops = Array.isArray((booking as any)?.stops) ? (booking as any).stops : [];
+  const routePlanStopRecords = Array.isArray(routePlan?.routePlanStops) ? routePlan.routePlanStops : [];
+  const fallbackStops = Array.isArray(trip.routePlanStops) ? trip.routePlanStops : routePlanStopRecords;
+
+  const candidates = [...explicitStops, ...fallbackStops, ...planStops, ...bookingStops].filter(Boolean);
+  return candidates.map((stop: any) => ({
+    name: stop?.name || stop?.label || stop?.stop_name || "Stop",
+    label: stop?.label || stop?.name || stop?.stop_name || "Stop",
+    lat: stop?.lat ?? stop?.latitude ?? stop?.location?.lat ?? null,
+    lng: stop?.lng ?? stop?.longitude ?? stop?.location?.lng ?? null,
+    status: stop?.status || undefined,
+  }));
+}
+
+function routeIsStarted(status?: string | null) {
+  return /^(started|in transit|en route|departed|on the way|picked up)$/i.test(String(status || ""));
+}
+
+function distanceKmBetween(start: LatLng, end: LatLng) {
+  const toRadians = (degrees: number) => (degrees * Math.PI) / 180;
+  const earthRadiusKm = 6371;
+  const dLat = toRadians(end.lat - start.lat);
+  const dLng = toRadians(end.lng - start.lng);
+  const lat1 = toRadians(start.lat);
+  const lat2 = toRadians(end.lat);
+
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+}
+
 const isActiveTripStatus = (status?: string | null) => {
   return isOperationalTrip({ id: status ? "status" : null, status });
 };
 
-const isDriverAcceptedTripStatus = (status?: string | null) => {
-  const normalized = String(status || "").trim().toLowerCase().replace(/[_-]+/g, " ");
-  return ["accepted", "scheduled", "pickup confirmed", "in transit", "delivering", "en route", "moving"].includes(normalized);
-};
-
 function hasFreshDeviceLocation(trip: DashboardTrip, now: number) {
   const currentLocation = (trip as any).currentLocation;
+  if (typeof currentLocation?.is_fresh === "boolean") return currentLocation.is_fresh;
   const position = validCoordinates(
     currentLocation?.lat ?? (trip as any).locationLat,
     currentLocation?.lng ?? (trip as any).locationLng,
@@ -99,7 +145,9 @@ export default function MapSection({
   onToggleFullscreen?: () => void;
 }) {
   const [selectedDeliveryId, setSelectedDeliveryId] = useState<string | null>(null);
-  const [roadPaths, setRoadPaths] = useState<Record<string, LatLng[]>>({});
+  const [isMissionModalOpen, setIsMissionModalOpen] = useState(false);
+  const [mapFocusRequest, setMapFocusRequest] = useState(0);
+  const [pickupRoadPaths, setPickupRoadPaths] = useState<Record<string, { key: string; points: LatLng[]; distanceKm: number | null; durationMin: number | null }>>({});
   const [internalFullscreen, setInternalFullscreen] = useState(false);
   const [showCoordinates, setShowCoordinates] = useState(true);
   const [showOnlyTrackingVehicles, setShowOnlyTrackingVehicles] = useState(false);
@@ -107,6 +155,10 @@ export default function MapSection({
   const dragState = useRef<{ pointerId: number; startX: number; startY: number; offsetX: number; offsetY: number } | null>(null);
   const routePlansById = useMemo(
     () => Object.fromEntries(routePlans.filter((plan) => plan.id).map((plan) => [String(plan.id), plan])),
+    [routePlans]
+  );
+  const routePlansByTripId = useMemo(
+    () => Object.fromEntries(routePlans.filter((plan) => plan.trip_id || plan.tripId).map((plan) => [String(plan.trip_id || plan.tripId), plan])),
     [routePlans]
   );
 
@@ -154,19 +206,8 @@ export default function MapSection({
     [trips]
   );
   const activeTrips = useMemo(
-    () => {
-      const newestByVehicle = new Map<string, DashboardTrip>();
-      const now = Date.now();
-      uniqueTrips.filter((trip) => isActiveTripStatus(trip.status) && isDriverAcceptedTripStatus(trip.status) && hasFreshDeviceLocation(trip, now)).forEach((trip) => {
-        const vehicleId = String(trip.vehicleId || trip.vehicle_id || "");
-        if (!vehicleId || !vehicles.some((vehicle) => String(vehicle.id || "") === vehicleId)) return;
-        const current = newestByVehicle.get(vehicleId);
-        const timestamp = (value: DashboardTrip) => Date.parse(String(value.updatedAt || value.updated_at || value.createdAt || value.created_at || "")) || 0;
-        if (!current || timestamp(trip) > timestamp(current)) newestByVehicle.set(vehicleId, trip);
-      });
-      return Array.from(newestByVehicle.values());
-    },
-    [uniqueTrips, vehicles]
+    () => uniqueTrips.filter((trip) => isActiveTripStatus(trip.status)),
+    [uniqueTrips]
   );
 
   const visibleTrips = useMemo(
@@ -175,11 +216,14 @@ export default function MapSection({
   );
 
   const calculateEtaAndProgress = (trip: DashboardTrip) => {
-    const arrival = (trip as any).estimatedArrival || (trip as any).estimated_arrival;
+    const plan = trip.routePlan ?? trip.route_plan;
+    const arrival = trip.estimated_arrival || trip.eta_at
+      || plan?.routeDetails?.schedule?.expected_arrival
+      || plan?.route_details?.schedule?.expected_arrival;
     const arrivalTime = arrival ? Date.parse(String(arrival)) : NaN;
     return {
       etaMinutes: Number.isFinite(arrivalTime) ? Math.max(0, Math.ceil((arrivalTime - Date.now()) / 60000)) : null,
-      progress: Number(trip?.progress || 0),
+      progress: trip?.progress == null || !Number.isFinite(Number(trip.progress)) ? null : Number(trip.progress),
     };
   };
 
@@ -199,53 +243,12 @@ export default function MapSection({
     return driver?.name || driver?.full_name || "Unassigned driver";
   };
 
-  type MapStop = {
-    id?: string | null;
-    name?: string | null;
-    label?: string | null;
-    lat?: number | null;
-    lng?: number | null;
-    latitude?: number | null;
-    longitude?: number | null;
-    status?: string | null;
-  };
-
-  const normalizeStop = (trip: DashboardTrip, stop: MapStop, index: number) => {
-    const position = validCoordinates(stop?.lat ?? stop?.latitude, stop?.lng ?? stop?.longitude);
-    if (!position) return null;
-
-    return {
-      id: stop?.id || `${trip.id || 'trip'}-stop-${index}`,
-      name: stop?.name || stop?.label || `Stop ${index + 1}`,
-      ...position,
-      status: stop?.status || 'pending',
-    };
-  };
-
-  const resolveTripStops = (trip: DashboardTrip, booking?: DashboardBooking, routePlan?: any) => {
-    const explicitStops: MapStop[] = Array.isArray(trip.stops) ? trip.stops as MapStop[] : [];
-    const routePlanStops: MapStop[] = Array.isArray(trip.routePlanStops)
-      ? trip.routePlanStops as MapStop[]
-      : Array.isArray(routePlan?.deliveryDestinations)
-        ? routePlan.deliveryDestinations
-        : [];
-    const bookingStops: MapStop[] = Array.isArray((booking as any)?.deliveryDestinations)
-      ? (booking as any).deliveryDestinations
-      : [];
-    const sourceStops = explicitStops.length > 0 ? explicitStops : routePlanStops.length > 0 ? routePlanStops : bookingStops;
-
-    return sourceStops
-      .map((stop, index) => normalizeStop(trip, stop, index))
-      .filter((stop): stop is { id: string; name: string; lat: number; lng: number; status: string } => Boolean(stop));
-  };
-
   const deliveries = useMemo(() => {
-    return visibleTrips.flatMap((trip) => {
+    const tripDeliveries = visibleTrips.flatMap((trip) => {
       const bookingId = (trip as any)?.bookingId || (trip as any)?.booking_id || "";
       const driverId = (trip as any)?.driverId || (trip as any)?.driver_id || "";
       const vehicleId = String(trip.vehicleId || trip.vehicle_id || "");
-      const vehicle = vehicles.find((item) => String(item.id || "") === vehicleId);
-      if (!vehicle) return [];
+      const vehicle = vehicles.find((item) => String(item.id || item.vehicle_id || "") === vehicleId);
       const driverName = (trip as any)?.driverName || (trip as any)?.driver_name || "";
       const currentLocation = (trip as any).currentLocation;
       const currentPos = validCoordinates(currentLocation?.lat ?? (trip as any).locationLat, currentLocation?.lng ?? (trip as any).locationLng);
@@ -276,24 +279,36 @@ export default function MapSection({
         );
       });
       const distinctTripParcels = Array.from(new Map(tripParcels.map((parcel) => [String(parcel.id), parcel])).values());
+      const firstParcel = distinctTripParcels[0];
       const parcelCount = distinctTripParcels.length || bookingParcelIds.size || Number((booking as any)?.parcelCount || (booking as any)?.parcel_count || 0) || bookingCargoCount;
-      const routePlan = routePlanId ? routePlansById[routePlanId] : null;
+      const routePlan = (routePlanId ? routePlansById[routePlanId] : null) || routePlansByTripId[tripId] || null;
+      const resolvedRoutePlanId = routePlanId || (routePlan ? String(routePlan.id || "") : "");
       const routePlanPolyline = normalizeRoutePlanPolyline(routePlan);
       
-      const stops = resolveTripStops(trip, booking, routePlan)
-        .map((s) => ({
-          name: s.name,
-          lat: s.lat,
-          lng: s.lng,
-          status: s.status || "pending",
-        }));
-      
-      const destinationStop = stops[stops.length - 1];
-      const destination = destinationStop?.name || trip.toLocation || trip.destination_location || (trip as any)?.to || "Unknown destination";
-      const originPos = trip.fromCoords || validCoordinates(trip.from_latitude, trip.from_longitude);
-      const destPos = destinationStop
-        ? { lat: destinationStop.lat, lng: destinationStop.lng }
-        : trip.toCoords || validCoordinates(trip.to_latitude, trip.to_longitude);
+      const orderedStops = resolveTripStops(trip, booking, routePlan);
+      const routeDestination = routePlan?.routeDetails?.destination || routePlan?.route_details?.destination;
+      const destinationRecord = routeDestination || orderedStops[orderedStops.length - 1] || null;
+      const destinationStop = orderedStops[orderedStops.length - 1];
+      const planDestinationIsSeparate = Boolean(routeDestination || destinationStop);
+      const routeStopRecords = routePlan && planDestinationIsSeparate ? orderedStops.slice(0, -1) : orderedStops;
+      const stops = routeStopRecords.map((stop) => ({
+        name: stop.name,
+        lat: stop.lat,
+        lng: stop.lng,
+        status: stop.status,
+      }));
+      const destination = String(destinationRecord?.name || destinationRecord?.label || trip.toLocation || trip.destination_location || (trip as any)?.to || "Unknown destination");
+      const originPos = trip.fromCoords || validCoordinates(trip.from_latitude, trip.from_longitude)
+        || (routePlan ? validCoordinates(routePlan.pickupLatitude ?? routePlan.pickup_latitude, routePlan.pickupLongitude ?? routePlan.pickup_longitude) : null);
+      const destPos = pointFromRouteRecord(destinationRecord)
+        || trip.toCoords || validCoordinates(trip.to_latitude, trip.to_longitude);
+      const validOrderedStopPoints = orderedStops.map((stop) => pointFromRouteRecord(stop));
+      const routeWaypoints = [originPos, ...validOrderedStopPoints.filter((point): point is LatLng => Boolean(point)), ...(destPos ? [destPos] : [])]
+        .filter((point): point is LatLng => Boolean(point))
+        .filter((point, index, points) => index === 0 || point.lat !== points[index - 1].lat || point.lng !== points[index - 1].lng);
+      const routeCoordinatesComplete = Boolean(originPos && destPos) && validOrderedStopPoints.every(Boolean);
+      const pickupStatus = String((trip as any).pickup_status || (trip as any).pickupStatus || "").toLowerCase().replace(/[_-]+/g, " ");
+      const routeStarted = pickupStatus === "started" || routeIsStarted(trip.status);
       
       const { etaMinutes, progress } = calculateEtaAndProgress(trip);
       
@@ -310,18 +325,27 @@ export default function MapSection({
 
       return [{
         id: trip.id || "",
+        routePlanId: routePlan ? String(routePlan.id || resolvedRoutePlanId) : null,
+        routePlanName: routePlan ? String(routePlan.route_name || routePlan.routeName || routePlan.routeDetails?.route_name || "") || null : null,
+        routeStarted,
+        routeWaypoints,
+        routeCoordinatesComplete,
+        isSavedPlan: false,
         vehicleId,
         name: resolvedDriverName,
         driverName: resolvedDriverName,
-        vehiclePlate: vehicle.plateNumber || vehicle.plate_number || "Unknown vehicle",
+        vehiclePlate: vehicle ? vehicle.plateNumber || vehicle.plate_number || null : null,
         parcelSummary: `${parcelCount} parcels — ${destination}${stops.length > 1 ? ` • ${stops.length} stops` : ""}`,
         parcelCount,
+        parcelReference: firstParcel ? firstParcel.trackingNumber || firstParcel.tracking_number || null : null,
+        recipientName: firstParcel ? firstParcel.recipientName || firstParcel.recipient_name || null : null,
         parcelDetails,
         origin: trip.fromLocation || trip.pickup_location || "Unknown pickup",
         destination,
         originPos,
         destPos,
         currentPos,
+        locationIsFresh: hasFreshDeviceLocation(trip, Date.now()),
         progress,
         etaMinutes,
         status: normalizeTripStatus(trip.status),
@@ -332,7 +356,57 @@ export default function MapSection({
         locationRecordedAt: currentLocation?.recorded_at || (trip as any).locationRecordedAt || null,
       } as Delivery];
     });
-  }, [visibleTrips, vehicles, bookings, parcels, drivers, routePlansById]);
+
+    return tripDeliveries;
+  }, [visibleTrips, vehicles, bookings, parcels, drivers, routePlans, routePlansById, routePlansByTripId]);
+
+  const selectedDelivery = deliveries.find((delivery) => delivery.id === selectedDeliveryId) || null;
+  const focusableDelivery = selectedDelivery?.currentPos && selectedDelivery.originPos
+    ? selectedDelivery
+    : deliveries.find((delivery) => delivery.currentPos && delivery.originPos) || selectedDelivery;
+  const canFocusRoute = Boolean(focusableDelivery?.currentPos && focusableDelivery.originPos);
+  const focusRoute = () => {
+    if (!canFocusRoute || !focusableDelivery) return;
+    setSelectedDeliveryId(focusableDelivery.id);
+    setMapFocusRequest((value) => value + 1);
+  };
+  const pickupRouteRequest = useMemo(() => {
+    if (!selectedDelivery?.currentPos || !selectedDelivery.originPos) return null;
+    const start = selectedDelivery.currentPos;
+    const pickup = selectedDelivery.originPos;
+    return {
+      key: `${selectedDelivery.id}:${start.lat},${start.lng}:${pickup.lat},${pickup.lng}`,
+      tripId: selectedDelivery.id,
+      waypoints: [start, pickup],
+    };
+  }, [selectedDelivery?.id, selectedDelivery?.currentPos?.lat, selectedDelivery?.currentPos?.lng, selectedDelivery?.originPos?.lat, selectedDelivery?.originPos?.lng]);
+
+  useEffect(() => {
+    if (!pickupRouteRequest) return;
+    let cancelled = false;
+    void fetch("/api/route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ waypoints: pickupRouteRequest.waypoints }),
+      cache: "no-store",
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((result) => {
+        if (cancelled || !Array.isArray(result?.polyline)) return;
+        const points = normalizeRoutePlanPolyline(result.polyline);
+        if (points) setPickupRoadPaths((current) => ({
+          ...current,
+          [pickupRouteRequest.tripId]: {
+            key: pickupRouteRequest.key,
+            points,
+            distanceKm: Number.isFinite(Number(result.distanceKm)) && Number(result.distanceKm) > 0 ? Number(result.distanceKm) : null,
+            durationMin: Number.isFinite(Number(result.durationMin)) && Number(result.durationMin) > 0 ? Number(result.durationMin) : null,
+          },
+        }));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [pickupRouteRequest]);
 
   const locatedVehicles = useMemo(
     () => Array.from(new Map(deliveries
@@ -354,102 +428,41 @@ export default function MapSection({
       "#06b6d4", // Cyan
       "#84cc16", // Lime
     ];
-    const uniqueCouriers = Array.from(new Set(deliveries.map((d) => d.courier || "LBC")));
+    const uniqueCouriers = Array.from(new Set(deliveries.map((d) => d.courier || "Airship Express")));
     uniqueCouriers.forEach((courier, idx) => {
       colors.set(courier, colorPalette[idx % colorPalette.length]);
     });
     return colors;
   }, [deliveries]);
 
-  const routeRequestKey = useMemo(
-    () => deliveries.map((delivery) => {
-      const stops = (delivery.stops || []).map((stop) => `${stop.lat},${stop.lng}`).join(";");
-      return `${delivery.id}:${delivery.originPos?.lat ?? ""},${delivery.originPos?.lng ?? ""}:${delivery.destPos?.lat ?? ""},${delivery.destPos?.lng ?? ""}:${stops}`;
-    }).join("|"),
-    [deliveries]
-  );
-
-  // Fetch one complete OSRM response per delivery and publish each result
-  // immediately instead of waiting for the slowest route in the batch.
-  useEffect(() => {
-    let cancelled = false;
-    setRoadPaths({});
-
-    const savedPaths = Object.fromEntries(
-      deliveries
-        .filter((delivery) => delivery.routePlanPolyline)
-        .map((delivery) => [delivery.id, delivery.routePlanPolyline])
-    ) as Record<string, LatLng[]>;
-    setRoadPaths(savedPaths);
-
-    deliveries.forEach((delivery) => {
-      if (delivery.routePlanPolyline) return;
-      if (!delivery.originPos || !delivery.destPos) return;
-      const waypoints = delivery.stops && delivery.stops.length > 0
-        ? [delivery.originPos, ...delivery.stops.map((s) => ({ lat: s.lat, lng: s.lng })), delivery.destPos]
-        : [delivery.originPos, delivery.destPos];
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 60000);
-
-      fetch("/api/route", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ waypoints }),
-        signal: controller.signal,
-        cache: "no-store",
-      })
-        .then((response) => response.ok ? response.json() : null)
-        .then((result) => {
-          if (cancelled || !Array.isArray(result?.polyline)) return;
-          if (result.polyline.length > 1) {
-            setRoadPaths((current) => ({
-              ...current,
-              [delivery.id]: result.polyline,
-            }));
-          }
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          window.clearTimeout(timeout);
-        });
-    });
-
-    return () => { cancelled = true; };
-  }, [routeRequestKey]);
-
   const coloredPaths = useMemo(
     () => {
-      const filtered = selectedDeliveryId
-        ? deliveries.filter((d) => d.id === selectedDeliveryId)
-        : deliveries;
+      const paths: Array<{ points: LatLng[]; color: string; label: string; dashArray?: string }> = [];
 
-      return filtered
-        .map((delivery) => {
-          const color = courierColors.get(delivery.courier || "LBC") || "#3b82f6";
-          const roadPath = roadPaths[delivery.id] || delivery.routePlanPolyline;
-          
-          if (roadPath && roadPath.length > 1) {
-            return {
-              points: roadPath,
-              color,
-              label: delivery.courier || "LBC",
-            };
-          }
-
-          return null;
-        })
-        .filter(Boolean) as Array<{ points: LatLng[]; color: string; label: string }>;
+      const pickupPath = selectedDelivery && pickupRouteRequest
+        ? pickupRoadPaths[selectedDelivery.id]
+        : null;
+      if (selectedDelivery && pickupRouteRequest) {
+        const hasCurrentRoadPath = pickupPath?.key === pickupRouteRequest.key;
+        paths.push({
+          points: hasCurrentRoadPath ? pickupPath.points : pickupRouteRequest.waypoints,
+          color: "#0284c7",
+          label: hasCurrentRoadPath ? "Vehicle to pickup" : "Direct direction to pickup",
+          ...(!hasCurrentRoadPath ? { dashArray: "7 7" } : {}),
+        });
+      }
+      return paths;
     },
-    [deliveries, roadPaths, courierColors, selectedDeliveryId]
+    [selectedDelivery, pickupRouteRequest, pickupRoadPaths]
   );
 
   const filteredDeliveries = useMemo(() => {
     const list = showOnlyTrackingVehicles
-      ? deliveries.filter((delivery) => delivery.currentPos)
+      ? deliveries.filter((delivery) => delivery.currentPos || delivery.id === selectedDeliveryId)
       : deliveries;
 
     return list;
-  }, [deliveries, showOnlyTrackingVehicles]);
+  }, [deliveries, showOnlyTrackingVehicles, selectedDeliveryId]);
 
   const mapMarkers = useMemo<LeafletMarker[]>(
     () => {
@@ -461,30 +474,40 @@ export default function MapSection({
           return;
         }
 
-        if (!delivery.currentPos) return;
-        const deliveryMarkers: LeafletMarker[] = [{
+        const deliveryMarkers: LeafletMarker[] = [];
+        if (selectedDeliveryId === delivery.id && delivery.originPos) deliveryMarkers.push({
+          id: `${delivery.id}-pickup`,
+          position: delivery.originPos,
+          color: "#db2777",
+          label: "Pickup",
+          meta: { title: "Pickup origin", subtitle: delivery.origin },
+        });
+        if (delivery.currentPos) deliveryMarkers.push({
             id: delivery.id,
             position: delivery.currentPos,
-            color: /delayed|critical/i.test(delivery.status) ? "#e11d48" : "#be185d",
+            color: /delayed|critical/i.test(delivery.status) ? "#e11d48" : delivery.locationIsFresh ? "#be185d" : "#64748b",
             isVehicle: true,
             label: (
               <div className="space-y-1 text-sm leading-tight">
                 <div className="font-semibold text-slate-900">{delivery.name}</div>
                 <div className="text-slate-600">Driver: {delivery.driverName}</div>
                 <div className="text-slate-600">Vehicle: {delivery.vehiclePlate}</div>
-                <div className="text-slate-600">ETA: {delivery.etaMinutes == null ? "Not available" : `${delivery.etaMinutes}m`}</div>
+                {delivery.currentPos && <div className="text-slate-600">Position: {delivery.locationIsFresh ? "Live GPS" : "Last known position"}</div>}
+                {delivery.etaMinutes != null && <div className="text-slate-600">ETA: {`${delivery.etaMinutes}m`}</div>}
                 <div className="text-slate-600">{delivery.parcelSummary}</div>
               </div>
             ),
             radius: /delayed|critical/i.test(delivery.status) ? 10 : 7,
             meta: {
               title: delivery.driverName || "Mission",
-              subtitle: `${delivery.courier || "Courier"} • ${delivery.vehiclePlate}`,
+              subtitle: delivery.vehiclePlate ? `${delivery.courier || "Courier"} • ${delivery.vehiclePlate}` : delivery.courier || "Courier",
               details: (
                 <div className="space-y-1 text-slate-600 text-sm">
                   <div><span className="font-semibold text-slate-800">Courier:</span> {delivery.courier || "Unassigned"}</div>
                   <div><span className="font-semibold text-slate-800">Driver:</span> {delivery.driverName}</div>
-                  <div><span className="font-semibold text-slate-800">Parcel count:</span> {delivery.parcelCount}</div>
+                  {delivery.vehiclePlate && <div><span className="font-semibold text-slate-800">Vehicle:</span> {delivery.vehiclePlate}</div>}
+                  {delivery.parcelCount > 0 && <div><span className="font-semibold text-slate-800">Parcel count:</span> {delivery.parcelCount}</div>}
+                  {delivery.currentPos && <div><span className="font-semibold text-slate-800">Position:</span> {delivery.locationIsFresh ? "Live GPS" : "Last known position"}</div>}
                   {showCoordinates && <div><span className="font-semibold text-slate-800">Coordinates:</span> {delivery.currentPos.lat.toFixed(5)}, {delivery.currentPos.lng.toFixed(5)}</div>}
                   <div className="pt-1 border-t border-slate-200 mt-1">
                     <div className="font-semibold text-slate-800">Parcel details</div>
@@ -503,47 +526,7 @@ export default function MapSection({
                 </div>
               ),
             },
-          }];
-
-        // Show stops when selected or in normal non-tracking view
-        if ((selectedDeliveryId === delivery.id || !showOnlyTrackingVehicles) && delivery.stops && delivery.stops.length > 0) {
-          delivery.stops.forEach((stop, index) => {
-            deliveryMarkers.push({
-              id: `${delivery.id}-stop-${index}`,
-              position: { lat: stop.lat, lng: stop.lng },
-              color: "#8b5cf6",
-              label: `Stop ${index + 1}: ${stop.name}`,
-              radius: 5,
-              meta: {
-                title: `Stop ${index + 1}`,
-                subtitle: stop.name,
-                details: <div className="text-sm text-slate-600">Delivery stop</div>,
-              },
-            });
           });
-        }
-
-        // Show destination when selected or in normal non-tracking view
-        if ((selectedDeliveryId === delivery.id || !showOnlyTrackingVehicles) && delivery.destPos) {
-          deliveryMarkers.push({
-            id: `${delivery.id}-dest`,
-            position: delivery.destPos,
-            color: "#f43f5e",
-            label: (
-              <div className="space-y-1 text-sm leading-tight">
-                <div className="font-semibold text-slate-900">Destination</div>
-                <div className="text-slate-600">{delivery.destination}</div>
-                <div className="text-slate-600">Route end point</div>
-              </div>
-            ),
-            radius: 6,
-            meta: {
-              title: "Destination",
-              subtitle: delivery.destination,
-              details: <div className="text-sm text-slate-600">Route end point</div>,
-            },
-          });
-        }
 
         markers.push(...deliveryMarkers);
       });
@@ -567,9 +550,18 @@ export default function MapSection({
     status: delivery.status,
     eta: delivery.etaMinutes,
     locationRecordedAt: delivery.locationRecordedAt,
+    locationIsFresh: delivery.locationIsFresh,
     lat: delivery.currentPos?.lat ?? null,
     lng: delivery.currentPos?.lng ?? null,
   }));
+  const selectedPickupPath = selectedDelivery && pickupRouteRequest && pickupRoadPaths[selectedDelivery.id]?.key === pickupRouteRequest.key
+    ? pickupRoadPaths[selectedDelivery.id]
+    : null;
+  const selectedPickupDistance = selectedPickupPath?.distanceKm
+    ?? (selectedDelivery?.currentPos && selectedDelivery.originPos ? distanceKmBetween(selectedDelivery.currentPos, selectedDelivery.originPos) : null);
+  const selectedPickupEta = selectedPickupPath?.durationMin
+    ? new Date(Date.now() + selectedPickupPath.durationMin * 60_000).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" })
+    : null;
 
   return (
     <>
@@ -592,16 +584,27 @@ export default function MapSection({
         </div>
       )}
 
-      {/* Map Container */}
+      {selectedDelivery && <section aria-label="Selected mission summary" className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-pink-100 bg-white px-4 py-3 text-[10px] text-slate-600 shadow-sm">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-pink-50 px-2.5 py-1 font-bold text-pink-700"><Activity className="h-3 w-3" />{selectedDelivery.status}</span>
+        <span className="inline-flex items-center gap-1.5"><UserRound className="h-3 w-3 text-pink-600" />{selectedDelivery.driverName}</span>
+        {selectedDelivery.vehiclePlate && <span className="inline-flex items-center gap-1.5"><Truck className="h-3 w-3 text-pink-600" />{selectedDelivery.vehiclePlate}</span>}
+        {(selectedDelivery.parcelCount > 0 || selectedDelivery.parcelReference || selectedDelivery.recipientName) && <span className="inline-flex items-center gap-1.5"><Package className="h-3 w-3 text-pink-600" />{selectedDelivery.parcelCount > 0 ? `${selectedDelivery.parcelCount} parcel${selectedDelivery.parcelCount === 1 ? "" : "s"}` : "Parcel"}{selectedDelivery.parcelReference && ` · ${selectedDelivery.parcelReference}`}{selectedDelivery.recipientName && ` · ${selectedDelivery.recipientName}`}</span>}
+        {selectedDelivery.origin && selectedDelivery.origin !== "Unknown pickup" && <span className="inline-flex items-center gap-1.5"><MapPin className="h-3 w-3 text-pink-600" />{selectedDelivery.origin}</span>}
+        {selectedPickupDistance != null && <span className="inline-flex items-center gap-1.5"><Route className="h-3 w-3 text-pink-600" />{selectedPickupPath?.distanceKm != null ? `${selectedPickupPath.distanceKm.toFixed(1)} km to pickup` : `Approx. ${selectedPickupDistance.toFixed(1)} km to pickup`}</span>}
+        {selectedPickupEta && <span className="inline-flex items-center gap-1.5"><Clock3 className="h-3 w-3 text-pink-600" />Pickup ETA {selectedPickupEta}</span>}
+        <button type="button" onClick={() => setMapFocusRequest((value) => value + 1)} disabled={!selectedDelivery.currentPos && !selectedDelivery.originPos} className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-1.5 font-bold text-sky-800 transition hover:bg-sky-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 disabled:cursor-not-allowed disabled:opacity-45"><Crosshair className="h-3 w-3" />Focus route</button>
+      </section>}
+
       <div
         style={isFullscreen ? { position: 'fixed', inset: 0, zIndex: 9999 } : undefined}
         className={isFullscreen ? "relative h-screen w-screen overflow-hidden bg-slate-950" : "relative h-[520px] w-full overflow-hidden rounded-xl border border-pink-100 bg-gradient-to-br from-blue-50 to-blue-100 mb-4"}
       >
-        {/* Map Background */}
         <LeafletMap
-          center={locatedVehicles[0]?.currentPos || undefined}
+          center={selectedDelivery?.currentPos || selectedDelivery?.originPos || locatedVehicles[0]?.currentPos || undefined}
           markers={mapMarkers}
           coloredPaths={showOnlyTrackingVehicles && !selectedDeliveryId ? [] : coloredPaths}
+          focusKey={selectedDeliveryId ? `${selectedDeliveryId}:${selectedDelivery?.currentPos?.lat ?? ""},${selectedDelivery?.currentPos?.lng ?? ""}:${selectedDelivery?.originPos?.lat ?? ""},${selectedDelivery?.originPos?.lng ?? ""}:${mapFocusRequest}` : null}
+          focusPoints={selectedDelivery ? [selectedDelivery.currentPos, selectedDelivery.originPos].filter((point): point is LatLng => Boolean(point)) : []}
           routeColor="#ec4899"
           className={isFullscreen ? "w-full h-full min-h-screen pointer-events-auto" : "h-full w-full rounded-xl overflow-hidden border border-pink-100 bg-gradient-to-br from-blue-50 to-blue-100"}
           onMarkerClick={(marker) => {
@@ -614,19 +617,22 @@ export default function MapSection({
           }}
         />
 
-        {/* Floating Overlays */}
         <div className="pointer-events-none absolute left-3 top-3 z-[10000] w-[260px] max-w-[calc(100%-1.5rem)] rounded-2xl border border-pink-100 bg-white/90 backdrop-blur-md p-3 shadow-xl shadow-pink-500/10">
           <div className="pointer-events-auto">
-            <div className="mb-2 flex items-center justify-between">
+            <div className="mb-2 flex items-center justify-between gap-2">
               <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-pink-700">Tracking</div>
-              <span className="text-[10px] font-medium text-slate-500">{filteredDeliveries.length} active</span>
+              <div className="flex items-center gap-2"><span className="text-[10px] font-medium text-slate-500">{filteredDeliveries.length} active</span><button type="button" onClick={focusRoute} disabled={!canFocusRoute} className="inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-2 py-1 text-[9px] font-bold text-sky-800 hover:bg-sky-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 disabled:cursor-not-allowed disabled:opacity-40"><Crosshair className="h-3 w-3" />Focus route</button></div>
             </div>
             <div className="space-y-2">
               {vehicleCards.length > 0 ? vehicleCards.map((vehicle) => (
                 <button
                   key={vehicle.id}
                   type="button"
-                  onClick={() => setSelectedDeliveryId(selectedDeliveryId === vehicle.id ? null : vehicle.id)}
+                  onClick={() => setSelectedDeliveryId(vehicle.id)}
+                  onDoubleClick={() => {
+                    setSelectedDeliveryId(vehicle.id);
+                    setIsMissionModalOpen(true);
+                  }}
                   className={`w-full rounded-xl border p-2 text-left transition ${
                     selectedDeliveryId === vehicle.id
                       ? "border-pink-400 bg-pink-100/40 shadow-md shadow-pink-200/50"
@@ -636,7 +642,7 @@ export default function MapSection({
                   <div className="flex items-center justify-between gap-2">
                     <div className="min-w-0">
                       <div className="truncate text-[11px] font-bold text-slate-800">{vehicle.name}</div>
-                      <div className="truncate text-[10px] text-slate-500">{vehicle.plate}</div>
+                      {vehicle.plate && <div className="truncate text-[10px] text-slate-500">{vehicle.plate}</div>}
                     </div>
                     <div className="flex items-center gap-2">
                       {selectedDeliveryId === vehicle.id && (
@@ -648,13 +654,13 @@ export default function MapSection({
                     </div>
                   </div>
                   <div className="mt-1 flex items-center justify-between text-[10px] text-slate-500">
-                    <span>ETA {vehicle.eta == null ? "Not available" : `${vehicle.eta}m`}</span>
+                    {vehicle.eta != null && <span>ETA {vehicle.eta}m</span>}
                     {vehicle.lat != null && vehicle.lng != null
                       ? showCoordinates && <span>{vehicle.lat.toFixed(4)}, {vehicle.lng.toFixed(4)}</span>
                       : <span className="font-semibold text-amber-700">No Location Data</span>}
                   </div>
                   {vehicle.locationRecordedAt && (
-                    <div className="mt-1 text-[9px] text-slate-400">GPS updated {new Date(vehicle.locationRecordedAt).toLocaleString()}</div>
+                    <div className="mt-1 text-[9px] text-slate-400">{vehicle.locationIsFresh ? "GPS updated" : "Last known GPS"} {new Date(vehicle.locationRecordedAt).toLocaleString()}</div>
                   )}
                 </button>
               )) : (
@@ -666,7 +672,6 @@ export default function MapSection({
           </div>
         </div>
 
-        {/* Fullscreen Exit Button - Top Right */}
         {isFullscreen && (
           <>
             <button
@@ -684,7 +689,6 @@ export default function MapSection({
               ✕ Exit full
             </button>
 
-            {/* Tracking Only Toggle - Floating Button */}
             <button
               type="button"
               onClick={() => setShowOnlyTrackingVehicles((value) => !value)}
@@ -749,10 +753,10 @@ export default function MapSection({
       )}
 
       {/* Mission Info Panel */}
-      {selectedDeliveryId && typeof document !== "undefined" && createPortal(
+      {isMissionModalOpen && selectedDeliveryId && typeof document !== "undefined" && createPortal(
         <div
           className="fixed inset-0 z-[2147483645] bg-black/25"
-          onClick={() => setSelectedDeliveryId(null)}
+          onClick={() => setIsMissionModalOpen(false)}
         >
           <div
             role="dialog"
@@ -796,7 +800,7 @@ export default function MapSection({
               <h2 id="mission-details-title" className="text-lg font-bold text-slate-900">Mission Details</h2>
               <button
                 onPointerDown={(event) => event.stopPropagation()}
-                onClick={() => setSelectedDeliveryId(null)}
+                onClick={() => setIsMissionModalOpen(false)}
                 className="text-slate-400 hover:text-slate-600 text-xl"
               >
                 ✕
@@ -831,10 +835,10 @@ export default function MapSection({
                           <span className="font-semibold text-slate-800">Driver:</span>{" "}
                           {delivery.driverName}
                         </div>
-                        <div>
+                        {delivery.vehiclePlate && <div>
                           <span className="font-semibold text-slate-800">Vehicle:</span>{" "}
                           {delivery.vehiclePlate}
-                        </div>
+                        </div>}
                         <div>
                           <span className="font-semibold text-slate-800">Parcel Count:</span>{" "}
                           {delivery.parcelCount}
@@ -855,14 +859,11 @@ export default function MapSection({
                             {delivery.status}
                           </span>
                         </div>
-                        <div>
-                          <span className="font-semibold text-slate-800">ETA:</span>{" "}
-                          {delivery.etaMinutes == null
-                            ? "Not available"
-                            : delivery.etaMinutes > 60
-                            ? `${Math.floor(delivery.etaMinutes / 60)}h ${delivery.etaMinutes % 60}m`
-                            : `${delivery.etaMinutes}m`}
-                        </div>
+                        {delivery.etaMinutes != null && <div><span className="font-semibold text-slate-800">ETA:</span>{" "}{delivery.etaMinutes > 60 ? `${Math.floor(delivery.etaMinutes / 60)}h ${delivery.etaMinutes % 60}m` : `${delivery.etaMinutes}m`}</div>}
+                        {delivery.currentPos && <div><span className="font-semibold text-slate-800">Vehicle location:</span>{" "}{delivery.locationIsFresh ? "Live GPS" : "Last known position"}{showCoordinates ? ` · ${delivery.currentPos.lat.toFixed(5)}, ${delivery.currentPos.lng.toFixed(5)}` : ""}</div>}
+                        {delivery.locationRecordedAt && <div><span className="font-semibold text-slate-800">GPS recorded:</span>{" "}{new Date(delivery.locationRecordedAt).toLocaleString()}</div>}
+                        {delivery.originPos && <div><span className="font-semibold text-slate-800">Pickup coordinates:</span>{" "}{delivery.originPos.lat.toFixed(5)}, {delivery.originPos.lng.toFixed(5)}</div>}
+                        {delivery.currentPos && delivery.originPos && <div><span className="font-semibold text-slate-800">Direction to pickup:</span>{" "}{pickupRouteRequest?.tripId === delivery.id && pickupRoadPaths[delivery.id]?.key === pickupRouteRequest.key ? "Road route" : "Direct fallback while routing"}</div>}
                       </div>
                     </div>
 
@@ -885,37 +886,6 @@ export default function MapSection({
                       )}
                     </div>
 
-                    {/* Route Info */}
-                    {delivery.stops && delivery.stops.length > 0 && (
-                      <div className="border-t border-slate-200 pt-3 space-y-2">
-                        <h4 className="text-sm font-semibold text-slate-800">Route ({delivery.stops.length + 1} stops)</h4>
-                        <div className="space-y-2 text-xs text-slate-600">
-                          <div className="flex items-start gap-2">
-                            <span className="text-green-600 font-bold mt-0.5">◆</span>
-                            <div>
-                              <p className="font-semibold text-slate-800">Origin</p>
-                              <p>{delivery.origin}</p>
-                            </div>
-                          </div>
-                          {delivery.stops.map((stop, idx) => (
-                            <div key={idx} className="flex items-start gap-2">
-                              <span className="text-purple-600 font-bold mt-0.5">◆</span>
-                              <div>
-                                <p className="font-semibold text-slate-800">Stop {idx + 1}</p>
-                                <p>{stop.name}</p>
-                              </div>
-                            </div>
-                          ))}
-                          <div className="flex items-start gap-2">
-                            <span className="text-red-600 font-bold mt-0.5">◆</span>
-                            <div>
-                              <p className="font-semibold text-slate-800">Destination</p>
-                              <p>{delivery.destination}</p>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    )}
                   </div>
                 ))}
             </div>

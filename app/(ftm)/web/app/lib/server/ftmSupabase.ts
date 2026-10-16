@@ -44,17 +44,15 @@ export function createFtmServiceClient() {
 }
 
 export function createFtmParcelClient() {
-  const parcelUrl = process.env.FTM_PARCELS_SUPABASE_URL || process.env.PARCELS_SUPABASE_URL;
-  const url = parcelUrl || getSupabaseUrl();
-  const parcelKey =
-    process.env.FTM_PARCELS_SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.PARCELS_SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.FTM_PARCELS_SUPABASE_ANON_KEY ||
-    process.env.PARCELS_SUPABASE_ANON_KEY ||
-    process.env.NEXT_PUBLIC_FTM_PARCEL_SUPABASE_ANON_KEY ||
-    process.env.NEXT_PUBLIC_PARCEL_SUPABASE_ANON_KEY;
-  const coreKey = process.env.FTM_SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const key = parcelUrl ? parcelKey : parcelKey || coreKey;
+  const key =
+    process.env.FTM_SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.FTM_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_FTM_SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC__FTM_SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const url = getSupabaseUrl();
   if (!url || !key) return null;
   return createClient(url, key, {
     auth: {

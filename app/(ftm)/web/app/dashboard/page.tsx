@@ -33,10 +33,13 @@ import {
 
 export type DashboardVehicle = {
   id?: string;
+  vehicle_id?: string | null;
   plate_number?: string | null;
   plateNumber?: string | null;
   vehicleType?: string | null;
+  vehicle_type?: string | null;
   status?: string | null;
+  availability?: string | null;
   driver_id?: string | null;
   driver?: string | null;
   driverName?: string | null;
@@ -94,7 +97,31 @@ export type DashboardTrip = {
   updated_at?: string | null;
   createdAt?: string | null;
   created_at?: string | null;
-  currentLocation?: { lat: number; lng: number; recorded_at?: string | null; source?: string } | null;
+  actual_arrival?: string | null;
+  actualArrival?: string | null;
+  completed_at?: string | null;
+  completedAt?: string | null;
+  delivered_at?: string | null;
+  deliveredAt?: string | null;
+  estimated_arrival?: string | null;
+  eta_at?: string | null;
+  actual_departure?: string | null;
+  routePlan?: {
+    routeDetails?: { schedule?: { window_end?: string | null; expected_arrival?: string | null } | null } | null;
+    route_details?: { schedule?: { window_end?: string | null; expected_arrival?: string | null } | null } | null;
+  } | null;
+  route_plan?: {
+    routeDetails?: { schedule?: { window_end?: string | null; expected_arrival?: string | null } | null } | null;
+    route_details?: { schedule?: { window_end?: string | null; expected_arrival?: string | null } | null } | null;
+  } | null;
+  actual_distance_km?: number | string | null;
+  odometer_start_km?: number | string | null;
+  odometer_end_km?: number | string | null;
+  actual_fuel_consumed_liters?: number | string | null;
+  fuel_consumed_liters?: number | string | null;
+  consumed_liters?: number | string | null;
+  fuel_used_liters?: number | string | null;
+  currentLocation?: { lat: number; lng: number; recorded_at?: string | null; source?: string; is_fresh?: boolean } | null;
   proof_of_delivery?: Record<string, any> | null;
   proofOfDelivery?: Record<string, any> | null;
   events?: Array<{ status?: string | null; remarks?: string | null; created_at?: string | null }>;
@@ -114,6 +141,7 @@ export type DashboardSnapshot = {
   trips: DashboardTrip[];
   bookings: DashboardBooking[];
   routePlans?: Array<Record<string, any>>;
+  sourceErrors?: string[];
   drivers: Array<{
     id?: string;
     full_name?: string | null;
@@ -122,29 +150,74 @@ export type DashboardSnapshot = {
   }>;
 };
 // Helper functions to calculate real data from API
-const calculateFuelConsumptionData = (fuelLogs: any[], trips: DashboardTrip[]) => {
-  const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+function getMeasuredTripFuelLiters(trip: DashboardTrip) {
+  const liters = Number(trip.actual_fuel_consumed_liters ?? trip.fuel_consumed_liters ?? trip.consumed_liters ?? trip.fuel_used_liters);
+  return Number.isFinite(liters) && liters > 0 ? liters : null;
+}
+
+function getMeasuredTripDistanceKm(trip: DashboardTrip) {
+  const actualDistance = Number(trip.actual_distance_km);
+  if (Number.isFinite(actualDistance) && actualDistance > 0) return actualDistance;
+  const start = Number(trip.odometer_start_km);
+  const end = Number(trip.odometer_end_km);
+  return Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end > start ? end - start : null;
+}
+
+const calculateFuelConsumptionData = (trips: DashboardTrip[]) => {
+  const litersByDate = new Map<string, number>();
+  trips.forEach((trip) => {
+    const liters = getMeasuredTripFuelLiters(trip);
+    const rawDate = trip.actual_arrival || trip.actual_departure || trip.updatedAt || trip.updated_at || trip.createdAt || trip.created_at;
+    if (liters == null || !rawDate) return;
+    const date = new Date(rawDate);
+    if (Number.isNaN(date.getTime())) return;
+    const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+    litersByDate.set(key, (litersByDate.get(key) || 0) + liters);
+  });
+  if (!litersByDate.size) return [];
   const today = new Date();
-  
-  return days.map((day, idx) => {
-    const dayDate = new Date(today);
-    dayDate.setDate(today.getDate() - (6 - idx));
-    
-    const dayLogs = fuelLogs.filter(log => {
-      const logDate = new Date(log.loggedAt || log.logged_at);
-      return logDate.toDateString() === dayDate.toDateString();
-    });
-    
-    const consumption = dayLogs.reduce((sum, log) => sum + (log.liters || 0), 0);
-    const efficiency = dayLogs.length > 0 && consumption > 0 
-      ? (dayLogs.reduce((sum, log) => sum + (log.cost || 0), 0) / consumption).toFixed(1) 
-      : "0.0";
-    
-    return { day, consumption, efficiency };
+  return Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 6 + index);
+    const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+    return { day: date.toLocaleDateString("en-PH", { weekday: "short" }), consumption: litersByDate.get(key) ?? null };
   });
 };
 
 const isFuelCategory = (value?: string | null) => /fuel|energy/i.test(String(value ?? ""));
+
+function isDashboardCompletedTrip(trip: DashboardTrip) {
+  return /^(complete|completed|delivered|finished|arrived)$/i.test(String(trip.status || "").trim().replace(/[_-]+/g, " "));
+}
+
+function tripCompletionTime(trip: DashboardTrip) {
+  const value = trip.actual_arrival ?? trip.actualArrival ?? trip.completed_at ?? trip.completedAt
+    ?? trip.delivered_at ?? trip.deliveredAt ?? trip.proof_of_delivery?.delivered_at
+    ?? trip.proofOfDelivery?.delivered_at;
+  if (!value) return null;
+  const date = new Date(String(value));
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function tripDeliveryDeadline(trip: DashboardTrip) {
+  const plan = trip.routePlan ?? trip.route_plan;
+  const value = plan?.routeDetails?.schedule?.window_end ?? plan?.route_details?.schedule?.window_end;
+  if (!value) return null;
+  const date = new Date(String(value));
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function onTimeOutcome(trip: DashboardTrip) {
+  if (!isDashboardCompletedTrip(trip)) return null;
+  const completedAt = tripCompletionTime(trip);
+  const deadline = tripDeliveryDeadline(trip);
+  return completedAt && deadline ? completedAt.getTime() <= deadline.getTime() : null;
+}
+
+function tripActivityTime(trip: DashboardTrip) {
+  return isDashboardCompletedTrip(trip)
+    ? tripCompletionTime(trip)
+    : trip.created_at || trip.createdAt ? new Date(String(trip.created_at || trip.createdAt)) : null;
+}
 
 const calculateCostBreakdownData = (costEntries: any[]) => {
   const breakdown: Record<string, number> = {
@@ -177,20 +250,24 @@ const calculateCostBreakdownData = (costEntries: any[]) => {
 };
 
 const calculateFleetUtilizationData = (vehicles: DashboardVehicle[]) => {
-  const vehiclesByType = vehicles.reduce((acc, v) => {
-    const type = v.vehicleType || "Unknown";
-    if (!acc[type]) acc[type] = { active: 0, idle: 0, maintenance: 0 };
-    if (v.status === "active" || v.status === "moving") acc[type].active++;
-    else if (v.status === "idle") acc[type].idle++;
-    else acc[type].maintenance++;
-    return acc;
-  }, {} as Record<string, any>);
-  return Object.entries(vehiclesByType).map(([category, data]) => ({
-    category,
-    active: data.active,
-    idle: data.idle,
-    maintenance: data.maintenance,
-  }));
+  const vehiclesByType = new Map<string, { active?: number; idle?: number; maintenance?: number }>();
+  vehicles.forEach((vehicle) => {
+    const category = String(vehicle.vehicleType || vehicle.vehicle_type || "").trim();
+    const status = String(vehicle.status || vehicle.availability || "").trim().toLowerCase().replace(/[_-]+/g, " ");
+    if (!category) return;
+    const state = /maintenance|service|repair|out of service/.test(status)
+      ? "maintenance"
+      : /available|idle|ready|standby|free/.test(status)
+        ? "idle"
+        : /active|moving|in transit|assigned|on trip|in use/.test(status)
+          ? "active"
+          : null;
+    if (!state) return;
+    const counts = vehiclesByType.get(category) || {};
+    counts[state] = (counts[state] || 0) + 1;
+    vehiclesByType.set(category, counts);
+  });
+  return [...vehiclesByType].map(([category, counts]) => ({ category, ...counts }));
 };
 
 const calculateDeliveryPerformanceData = (trips: DashboardTrip[]) => {
@@ -198,15 +275,18 @@ const calculateDeliveryPerformanceData = (trips: DashboardTrip[]) => {
   return Array.from({ length: 6 }, (_, index) => {
     const monthDate = new Date(now.getFullYear(), now.getMonth() - (5 - index), 1);
     const nextMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1);
-    const monthTrips = trips.filter((trip) => {
-      const timestamp = trip.updatedAt || trip.updated_at || trip.createdAt;
-      const date = timestamp ? new Date(timestamp) : null;
-      return date && !Number.isNaN(date.getTime()) && date >= monthDate && date < nextMonth;
-    });
-    const delayed = monthTrips.filter((trip) => /delayed|late|exception/i.test(String(trip.status ?? ""))).length;
-    const completed = monthTrips.filter((trip) => /completed|delivered|arrived/i.test(String(trip.status ?? ""))).length;
-    return { month: monthDate.toLocaleDateString("en-US", { month: "short" }), onTime: Math.max(0, completed - delayed), delayed };
-  });
+    const validOutcomes = trips.filter((trip) => {
+      const date = tripCompletionTime(trip);
+      return date && date >= monthDate && date < nextMonth && onTimeOutcome(trip) != null;
+    }).map(onTimeOutcome).filter((value): value is boolean => value !== null);
+    if (!validOutcomes.length) return null;
+    const onTimeCount = validOutcomes.filter(Boolean).length;
+    return {
+      month: monthDate.toLocaleDateString("en-US", { month: "short" }),
+      onTime: Number((onTimeCount / validOutcomes.length * 100).toFixed(1)),
+      delayed: Number(((validOutcomes.length - onTimeCount) / validOutcomes.length * 100).toFixed(1)),
+    };
+  }).filter((month): month is NonNullable<typeof month> => month !== null);
 };
 
 const calculateParcelTrendData = (parcels: any[], timeframe: "daily" | "weekly" | "monthly" = "weekly") => {
@@ -395,6 +475,7 @@ export default function Home() {
   const [fuelLogs, setFuelLogs] = useState<any[]>([]);
   const [costEntries, setCostEntries] = useState<any[]>([]);
   const [parcels, setParcels] = useState<any[]>([]);
+  const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [parcelTimeframe, setParcelTimeframe] = useState<"daily" | "weekly" | "monthly">("weekly");
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -418,6 +499,7 @@ export default function Home() {
         setParcels(Array.isArray(data.parcels) ? data.parcels : []);
         setFuelLogs(Array.isArray(data.fuelLogs) ? data.fuelLogs : []);
         setCostEntries(Array.isArray(data.costEntries) ? data.costEntries : []);
+        setSourceErrors(Array.isArray(data.sourceErrors) ? data.sourceErrors : []);
         setError(null);
       } catch (requestError) {
         console.error("Failed to load dashboard data:", requestError);
@@ -489,15 +571,7 @@ export default function Home() {
     .filter((trip) => trip.id)
     .map((trip) => [String(trip.id), trip])).values());
   const dashboardVehicleIds = new Set(uniqueVehicles.map((vehicle) => String(vehicle.id)));
-  const activeTripsByVehicle = new Map<string, DashboardTrip>();
-  uniqueTrips.filter((trip) => isOperationalTrip({ id: trip.id, status: trip.status })).forEach((trip) => {
-    const vehicleId = String(trip.vehicleId || trip.vehicle_id || "");
-    if (!vehicleId || !dashboardVehicleIds.has(vehicleId)) return;
-    const current = activeTripsByVehicle.get(vehicleId);
-    const timestamp = (value: DashboardTrip) => Date.parse(String(value.updatedAt || value.updated_at || value.createdAt || value.created_at || "")) || 0;
-    if (!current || timestamp(trip) > timestamp(current)) activeTripsByVehicle.set(vehicleId, trip);
-  });
-  const activeTrips = Array.from(activeTripsByVehicle.values());
+  const activeTrips = uniqueTrips.filter((trip) => isOperationalTrip({ id: trip.id, status: trip.status }));
   const activeTripsCount = activeTrips.length;
   const activeVehiclesCount = uniqueVehicles.filter((vehicle) => /^(active|moving|in transit|assigned)$/i.test(String(vehicle.status ?? "").replace(/[_-]+/g, " ").trim())).length;
   const pendingBookingsCount = snapshot.bookings.filter((booking) => /^pending$/i.test(String(booking.status ?? "").trim())).length;
@@ -507,7 +581,7 @@ export default function Home() {
   const totalDriversCount = new Set(snapshot.drivers.map((driver) => driver.id).filter(Boolean)).size;
 
   // Calculate real metrics
-  const fuelConsumptionData = calculateFuelConsumptionData(fuelLogs, uniqueTrips);
+  const fuelConsumptionData = calculateFuelConsumptionData(uniqueTrips);
   const costBreakdownData = calculateCostBreakdownData(costEntries);
   const fleetUtilizationData = calculateFleetUtilizationData(uniqueVehicles);
   const deliveryPerformanceData = calculateDeliveryPerformanceData(uniqueTrips);
@@ -518,15 +592,20 @@ export default function Home() {
   const driverPerformanceData = calculateDriverPerformanceData(uniqueTrips, snapshot.drivers);
 
   // Calculate KPI values from real data
-  const fleetEfficiency = fuelLogs.length > 0 && fuelLogs.reduce((sum, log) => sum + (log.liters || 0), 0) > 0
-    ? (fuelLogs.reduce((sum, log) => sum + (log.cost || 0), 0) / fuelLogs.reduce((sum, log) => sum + (log.liters || 0), 1)).toFixed(1)
-    : "0.0";
+  const pairedFuelMeasurements = uniqueTrips.map((trip) => ({
+    distanceKm: getMeasuredTripDistanceKm(trip),
+    liters: getMeasuredTripFuelLiters(trip),
+  })).filter((measurement) => measurement.distanceKm != null && measurement.distanceKm > 0 && measurement.liters != null && measurement.liters > 0);
+  const efficiencyDistanceKm = pairedFuelMeasurements.reduce((sum, measurement) => sum + (measurement.distanceKm || 0), 0);
+  const efficiencyFuelLiters = pairedFuelMeasurements.reduce((sum, measurement) => sum + (measurement.liters || 0), 0);
+  const fleetEfficiency = efficiencyFuelLiters > 0 ? (efficiencyDistanceKm / efficiencyFuelLiters).toFixed(1) : "No data available";
   
-  const completedTrips = uniqueTrips.filter((trip) => isCompletedTripStatus(trip.status)).length;
-  const onTimeTrips = completedTrips - uniqueTrips.filter((trip) => /delayed|late/i.test(String(trip.status ?? ""))).length;
-  const onTimeRate = completedTrips > 0 
-    ? ((onTimeTrips / completedTrips) * 100).toFixed(1) 
-    : "0.0";
+  const completedTripRows = uniqueTrips.filter((trip) => isCompletedTripStatus(trip.status));
+  const completedTrips = completedTripRows.length;
+  const validOnTimeOutcomes = completedTripRows.map(onTimeOutcome).filter((value): value is boolean => value !== null);
+  const onTimeRate = validOnTimeOutcomes.length
+    ? (validOnTimeOutcomes.filter(Boolean).length / validOnTimeOutcomes.length * 100).toFixed(1)
+    : null;
   
   const systemHealth = snapshot.vehicles.length > 0 && snapshot.trips.length > 0
     ? "Optimal" 
@@ -555,19 +634,10 @@ export default function Home() {
     : 0;
 
   // Calculate fuel management KPI values
-  const totalFuelConsumed = fuelLogs.reduce((sum, log) => sum + (log.liters || 0), 0);
+  const totalFuelReported = fuelLogs.reduce((sum, log) => sum + (log.liters || 0), 0);
   const totalFuelCost = costEntries
     .filter((entry) => isFuelCategory(entry.category))
     .reduce((sum, entry) => sum + (Number(entry.amount ?? entry.cost ?? 0) || 0), 0);
-  const fuelEfficiencyRatio = totalFuelConsumed > 0 
-    ? (totalFuelCost / totalFuelConsumed).toFixed(2) 
-    : "0.00";
-  const avgFuelPerTrip = uniqueTrips.length > 0
-    ? (totalFuelConsumed / uniqueTrips.length).toFixed(2)
-    : "0.00";
-  const avgFuelCostPerTrip = uniqueTrips.length > 0
-    ? (totalFuelCost / uniqueTrips.length).toFixed(2)
-    : "0.00";
 
   // Calculate cost analysis KPI values
   const totalOperatingCost = costEntries.reduce((sum, entry) => sum + (Number(entry.amount ?? entry.cost ?? 0) || 0), 0);
@@ -591,7 +661,7 @@ export default function Home() {
     "total-bookings": totalBookingsCount > 0 ? "100%" : "—",
     "total-drivers": totalDriversCount > 0 ? "100%" : "—",
     "fleet-efficiency": "—",
-    "on-time-rate": `${onTimeRate}%`,
+    "on-time-rate": onTimeRate == null ? "—" : `${onTimeRate}%`,
     "system-health": "—",
     "total-parcels": totalParcelsCount > 0 ? "100%" : "—",
     "total-fuel": "—",
@@ -643,6 +713,7 @@ export default function Home() {
       <GlobalNavbar />
 
       <main className="flex-1 w-full px-4 sm:px-6 py-6 space-y-6 bg-background">
+        {sourceErrors.length > 0 && <div role="status" className="flex flex-col gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 sm:flex-row sm:items-start sm:justify-between"><div><p className="font-bold">Some dashboard sources could not be loaded</p><ul className="mt-1 list-inside list-disc">{sourceErrors.map((sourceError) => <li key={sourceError}>{sourceError}</li>)}</ul><p className="mt-1 text-[10px]">Available trip and vehicle data is still shown; affected module metrics may be incomplete.</p></div><button type="button" onClick={() => window.location.reload()} className="shrink-0 rounded-md border border-amber-300 bg-white px-2.5 py-1.5 text-[10px] font-bold hover:bg-amber-100">Retry</button></div>}
         
         {/* Top Header Command Banner */}
         <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 bg-surface-container-lowest backdrop-blur-md rounded-2xl p-6 border border-outline-variant shadow-soft w-full">
@@ -762,7 +833,7 @@ export default function Home() {
           </div>
 
           {/* Card 9: On-Time Rate */}
-          <div className="rounded-lg border border-slate-200 bg-white p-3 cursor-pointer hover:border-pink-300 transition-colors" onClick={() => toggleKPIVisibility('on-time-rate')}>
+          {onTimeRate != null && <div className="rounded-lg border border-slate-200 bg-white p-3 cursor-pointer hover:border-pink-300 transition-colors" onClick={() => toggleKPIVisibility('on-time-rate')}>
             <div className="flex items-center justify-between text-[#b80049]">
               <span className="material-symbols-outlined text-[20px]">trending_up</span>
               <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-pink-50 text-pink-700">KPI</span>
@@ -771,7 +842,7 @@ export default function Home() {
               <div className="text-lg font-black text-slate-900">{renderKPIValue('on-time-rate', onTimeRate)}%{renderKPITrend('on-time-rate')}</div>
               <div className="text-[11px] font-medium text-slate-500 leading-tight mt-0.5">On-Time Rate</div>
             </div>
-          </div>
+          </div>}
 
           {/* Card 10: System Health */}
           <div className="rounded-lg border border-slate-200 bg-white p-3 cursor-pointer hover:border-pink-300 transition-colors" onClick={() => toggleKPIVisibility('system-health')}>
@@ -797,15 +868,15 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Card 12: Total Fuel Consumed */}
+          {/* Card 12: Reported Fuel Volume */}
           <div className="rounded-lg border border-slate-200 bg-white p-3 cursor-pointer hover:border-pink-300 transition-colors" onClick={() => toggleKPIVisibility('total-fuel')}>
             <div className="flex items-center justify-between text-[#b80049]">
               <span className="material-symbols-outlined text-[20px]">local_gas_station</span>
-              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">Fuel</span>
+              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">Fuel log</span>
             </div>
             <div className="mt-2">
-              <div className="text-lg font-black text-slate-900">{renderKPIValue('total-fuel', totalFuelConsumed.toFixed(1))}L{renderKPITrend('total-fuel')}</div>
-              <div className="text-[11px] font-medium text-slate-500 leading-tight mt-0.5">Total Fuel</div>
+              <div className="text-lg font-black text-slate-900">{renderKPIValue('total-fuel', totalFuelReported.toFixed(1))}L{renderKPITrend('total-fuel')}</div>
+              <div className="text-[11px] font-medium text-slate-500 leading-tight mt-0.5">Reported Fuel Volume</div>
             </div>
           </div>
 
@@ -877,6 +948,7 @@ export default function Home() {
                 </span>
               </div>
               <div className="h-[210px] w-full">
+                {fuelConsumptionData.length === 0 ? <div className="grid h-full place-items-center rounded-lg border border-dashed border-slate-200 bg-slate-50 px-4 text-center text-[11px] text-slate-500">No actual consumed-fuel measurements are available for this period. Refueling and purchase liters are excluded.</div> :
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={fuelConsumptionData} margin={{ top: 10, right: 10, left: -25, bottom: 0 }}>
                     <defs>
@@ -892,6 +964,7 @@ export default function Home() {
                     <Area type="monotone" dataKey="consumption" stroke="#b80049" strokeWidth={2} fillOpacity={1} fill="url(#colorFuel)" />
                   </AreaChart>
                 </ResponsiveContainer>
+                }
               </div>
             </div>
 

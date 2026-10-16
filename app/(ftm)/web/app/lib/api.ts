@@ -59,7 +59,33 @@ export async function exportSystemBackup() {
 }
 
 export async function getCurrentProfile() {
-  return fetchJson("/api/profile") as Promise<{ id: string; email: string | null; full_name: string | null; avatar_url: string | null }>;
+  return fetchJson("/api/profile") as Promise<{
+    id: string;
+    email: string | null;
+    full_name: string | null;
+    avatar_url: string | null;
+    role?: string | null;
+    phone?: string | null;
+    username?: string | null;
+    employee_id?: string | null;
+    department?: string | null;
+    license_number?: string | null;
+    license_expiry?: string | null;
+    courier_id?: string | null;
+    is_active?: boolean;
+    created_at?: string | null;
+    last_sign_in_at?: string | null;
+    updated_at?: string | null;
+  }>;
+}
+
+export async function updateCurrentProfile(payload: { full_name?: string; phone?: string }) {
+  return fetchJson("/api/profile", { method: "PATCH", body: JSON.stringify(payload) }) as Promise<{
+    id: string;
+    full_name: string | null;
+    phone: string | null;
+    updated_at: string | null;
+  }>;
 }
 
 export async function uploadProfileAvatar(content: string, onProgress?: (progress: number) => void) {
@@ -107,14 +133,12 @@ function reportBackendLoadFailure(resource: string, error: unknown) {
 }
 
 async function readSupabaseTable<T = Record<string, unknown>>(table: string, select = "*") {
-  try {
-    const { data, error } = await supabase.from(table).select(select).limit(200);
-    if (error) throw error;
-    return (Array.isArray(data) ? data : []) as T[];
-  } catch (error) {
-    console.warn(`[api] ${table} unavailable`, error);
-    return [] as T[];
+  const { data, error } = await supabase.from(table).select(select).limit(200);
+  if (error) {
+    reportBackendLoadFailure(table, error);
+    throw new Error(`Unable to load ${table}: ${error.message}`);
   }
+  return (Array.isArray(data) ? data : []) as T[];
 }
 
 function normalizeStatus(value: unknown) {
@@ -142,7 +166,7 @@ export async function getCostEntries() {
     }));
   } catch (error) {
     reportBackendLoadFailure("cost entries", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -151,26 +175,21 @@ export async function getDashboardSnapshot() {
     return await fetchJson('/api/dashboard');
   } catch (error) {
     reportBackendLoadFailure("dashboard snapshot", error);
-    return {
-      counts: { vehicles: 0, trips: 0, bookings: 0, drivers: 0 },
-      vehicles: [],
-      trips: [],
-      bookings: [],
-      parcels: [],
-      drivers: [],
-      costEntries: [],
-      fuelLogs: [],
-    };
+    throw error;
   }
 }
 
-export async function getTrips(options: { light?: boolean } = {}) {
+export async function getTrips(options: { light?: boolean; all?: boolean; performance?: boolean } = {}) {
   try {
-    const query = options.light ? "?light=true" : "";
+    const params = new URLSearchParams();
+    if (options.light) params.set("light", "true");
+    if (options.all) params.set("all", "true");
+    if (options.performance) params.set("performance", "true");
+    const query = params.toString() ? `?${params.toString()}` : "";
     return await fetchJson(`/api/trips${query}`);
   } catch (error) {
     reportBackendLoadFailure("trips", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -179,7 +198,7 @@ export async function getVehicles() {
     return await fetchJson('/api/vehicles');
   } catch (error) {
     reportBackendLoadFailure("vehicles", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -188,7 +207,7 @@ export async function getMaintenanceRecords() {
     return await fetchJson('/api/maintenance');
   } catch (error) {
     reportBackendLoadFailure("maintenance records", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -204,7 +223,7 @@ export async function getCouriers() {
     return await fetchJson('/api/vehicles/couriers');
   } catch (error) {
     reportBackendLoadFailure("couriers", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -228,6 +247,13 @@ export async function createVehicle(payload: Record<string, unknown>) {
   });
 }
 
+export async function updateVehicle(id: string, payload: Record<string, unknown>) {
+  return fetchJson('/api/vehicles', {
+    method: 'PATCH',
+    body: JSON.stringify({ ...payload, id }),
+  });
+}
+
 export async function createVehicleDocument(payload: Record<string, unknown>) {
   return fetchJson('/api/vehicles/documents', {
     method: 'POST',
@@ -247,7 +273,7 @@ export async function getBookings() {
     return await fetchJson('/api/bookings');
   } catch (error) {
     reportBackendLoadFailure("bookings", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -256,7 +282,7 @@ export async function getDrivers() {
     return await fetchJson('/api/drivers');
   } catch (error) {
     reportBackendLoadFailure("drivers", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -265,7 +291,7 @@ export async function getDriverAssignments() {
     return await fetchJson('/api/drivers/assignments');
   } catch (error) {
     reportBackendLoadFailure("driver assignments", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -310,7 +336,7 @@ export async function getParcels(options: { status?: string; history?: boolean }
     return await fetchJson(`/api/parcels${query}`);
   } catch (error) {
     reportBackendLoadFailure("parcels", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -319,54 +345,8 @@ export async function getParcelHistory() {
 }
 
 export async function getFuelLogs() {
-  try {
-    const logs = await fetchJson('/api/fuel/logs');
-    if (Array.isArray(logs) && logs.length > 0) return addFuelDistances(logs);
-
-    const fuelCosts = (await getCostEntries()).filter(
-      (entry: any) => String(entry.category || '').toLowerCase() === 'fuel'
-    );
-
-    return addFuelDistances(fuelCosts.map((entry: any) => ({
-      id: entry.id,
-      vehicleId: entry.vehicleId ?? null,
-      tripId: entry.tripId ?? null,
-      liters: entry.categoryCost?.liters != null ? Number(entry.categoryCost.liters) : null,
-      cost: entry.amount != null ? Number(entry.amount) : null,
-      odometerReading: entry.categoryCost?.odometer_reading != null
-        ? Number(entry.categoryCost.odometer_reading)
-        : null,
-      loggedAt: entry.entryDate ?? entry.recorded_at ?? entry.created_at ?? null,
-      fuelReceiptImage: entry.receipt_image ?? null,
-    })));
-  } catch (error) {
-    reportBackendLoadFailure("fuel logs", error);
-    return [] as any[];
-  }
-}
-
-function addFuelDistances(logs: any[]) {
-  const lastOdometerByVehicle = new Map<string, number>();
-  return logs
-    .slice()
-    .sort((a, b) => new Date(a.loggedAt ?? a.logged_at ?? a.createdAt ?? a.created_at ?? 0).getTime()
-      - new Date(b.loggedAt ?? b.logged_at ?? b.createdAt ?? b.created_at ?? 0).getTime())
-    .map((log) => {
-      if (Number.isFinite(Number(log.distance))) return log;
-
-      const vehicleId = String(log.vehicleId ?? log.vehicle_id ?? "unknown");
-      const odometer = Number(log.odometerReading ?? log.odometer_reading);
-      const previous = lastOdometerByVehicle.get(vehicleId);
-      lastOdometerByVehicle.set(vehicleId, odometer);
-
-      return {
-        ...log,
-        distance: Number.isFinite(odometer) && previous != null && odometer >= previous
-          ? odometer - previous
-          : 0,
-      };
-    })
-    .reverse();
+  const logs = await fetchJson('/api/fuel/logs');
+  return Array.isArray(logs) ? logs : [];
 }
 
 export async function getExpenses() {
@@ -374,7 +354,7 @@ export async function getExpenses() {
     return await fetchJson('/api/expenses');
   } catch (error) {
     reportBackendLoadFailure("expenses", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -399,7 +379,7 @@ export async function getInventoryItems() {
     return Array.isArray(items) ? items : [];
   } catch (error) {
     reportBackendLoadFailure("inventory items", error);
-    return [] as any[];
+    throw error;
   }
 }
 
@@ -453,11 +433,13 @@ export async function getAlertsSnapshot() {
   return { incidents, notifications, trackingEvents };
 }
 
-export async function getAlerts(options: { status?: string; category?: string; severity?: string } = {}) {
+export async function getAlerts(options: { status?: string; category?: string; severity?: string; limit?: number; offset?: number } = {}) {
   const params = new URLSearchParams();
   if (options.status) params.set("status", options.status);
   if (options.category) params.set("category", options.category);
   if (options.severity) params.set("severity", options.severity);
+  if (options.limit != null) params.set("limit", String(options.limit));
+  if (options.offset != null) params.set("offset", String(options.offset));
   const query = params.toString() ? `?${params.toString()}` : "";
   return fetchJson(`/api/alerts${query}`);
 }
@@ -469,8 +451,12 @@ export async function updateAlertStatus(id: string, status: "ACKNOWLEDGED" | "IN
   });
 }
 
-export async function getAlertHistory() {
-  return fetchJson("/api/alerts/history");
+export async function getAlertHistory(options: { limit?: number; offset?: number } = {}) {
+  const params = new URLSearchParams();
+  if (options.limit != null) params.set("limit", String(options.limit));
+  if (options.offset != null) params.set("offset", String(options.offset));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return fetchJson(`/api/alerts/history${query}`);
 }
 
 export async function getRoutePlans(courier?: string) {

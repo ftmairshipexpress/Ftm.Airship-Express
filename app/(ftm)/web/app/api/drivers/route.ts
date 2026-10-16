@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { hasPermission } from "../../lib/permissions";
 import { authenticateFtmRequest } from "../../lib/server/ftmRequestAuth";
+import { getAirshipCouriers } from "../../lib/server/ftmCourier";
 
 export const dynamic = "force-dynamic";
 
@@ -13,24 +14,47 @@ export async function GET(request: Request) {
   }
 
   try {
-    const { data: queriedDrivers, error } = await context.serviceClient
-      .from("users")
-      .select("id, email, full_name, role, is_active, courier_id, created_at, updated_at")
-      .eq("role", "driver")
-      .order("full_name", { ascending: true });
-    if (error || !queriedDrivers?.length) return NextResponse.json([]);
+    const couriers = await getAirshipCouriers(context.serviceClient);
+    const courierIds = new Set(couriers.map((courier) => courier.id));
+    if (!courierIds.size) return NextResponse.json([]);
+    const requestedCourierId = new URL(request.url).searchParams.get("courier_id");
+    if (requestedCourierId && !courierIds.has(requestedCourierId)) return NextResponse.json([]);
+    const queryDrivers = async (includePhone: boolean, includeLicense: boolean) => {
+      const fields = ["id", "email", "full_name", ...(includePhone ? ["phone"] : []), "role", "is_active", "courier_id", "created_at", "updated_at", ...(includeLicense ? ["license_number", "license_expiration"] : [])].join(", ");
+      const result = await context.serviceClient.from("users").select(fields).eq("role", "driver").in("courier_id", [...courierIds]).order("full_name", { ascending: true });
+      return { data: result.data as unknown as Array<Record<string, unknown>> | null, error: result.error };
+    };
+    let driverResult = await queryDrivers(true, true);
+    if (driverResult.error && /license_number|license_expiration|column .* does not exist|schema cache/i.test(driverResult.error.message)) {
+      driverResult = await queryDrivers(true, false);
+    }
+    if (driverResult.error && /phone|column .* does not exist|schema cache/i.test(driverResult.error.message)) {
+      driverResult = await queryDrivers(false, false);
+    }
+    const { data: queriedDrivers, error } = driverResult;
+    if (error) return NextResponse.json({ error: `Unable to load drivers: ${error.message}` }, { status: 500 });
+    if (!queriedDrivers?.length) return NextResponse.json([]);
 
-    const courierId = new URL(request.url).searchParams.get("courier_id");
-    const filteredDrivers = courierId
-      ? queriedDrivers.filter((driver) => String(driver.courier_id) === courierId)
-      : queriedDrivers;
-    if (!filteredDrivers.length) return NextResponse.json([]);
-
-    const courierIds = [...new Set(filteredDrivers.map((driver) => driver.courier_id).filter(Boolean))];
-    const { data: couriers } = courierIds.length
-      ? await context.serviceClient.from("couriers").select("id, name, code").in("id", courierIds)
-      : { data: [] };
-    const courierNames = new Map((couriers || []).map((courier) => [String(courier.id), courier.name]));
+    if (!queriedDrivers?.length) return NextResponse.json([]);
+    const filteredDrivers = queriedDrivers;
+    const courierNames = new Map(couriers.map((courier) => [courier.id, courier.name]));
+    const driverIds = filteredDrivers.map((driver) => String(driver.id));
+    const activeAssignmentStatuses = new Set(["assigned", "accepted", "in_progress"]);
+    const canonicalVehicleByDriver = new Map<string, string>();
+    if (driverIds.length) {
+      const { data: assignments } = await context.serviceClient
+        .from("booking_assignments")
+        .select("driver_id,vehicle_id,status,assigned_at")
+        .in("driver_id", driverIds)
+        .order("assigned_at", { ascending: false });
+      (assignments || []).forEach((assignment) => {
+        const driverId = assignment.driver_id == null ? "" : String(assignment.driver_id);
+        const vehicleId = assignment.vehicle_id == null ? "" : String(assignment.vehicle_id);
+        if (driverId && vehicleId && activeAssignmentStatuses.has(String(assignment.status || "").toLowerCase()) && !canonicalVehicleByDriver.has(driverId)) {
+          canonicalVehicleByDriver.set(driverId, vehicleId);
+        }
+      });
+    }
 
     const enriched = await Promise.all(filteredDrivers.map(async (driver) => {
       const result: Record<string, unknown> = {
@@ -38,7 +62,9 @@ export async function GET(request: Request) {
         status: driver.is_active === false ? "Inactive" : "Available",
         courier: courierNames.get(String(driver.courier_id)) || null,
       };
-      try {
+      const canonicalVehicleId = canonicalVehicleByDriver.get(String(driver.id));
+      if (canonicalVehicleId) result.vehicle_id = canonicalVehicleId;
+      else try {
         const { data: assignments, error: assignmentError } = await context.serviceClient
           .from("driver_assignments")
           .select("vehicle_id")
@@ -83,6 +109,6 @@ export async function GET(request: Request) {
     return NextResponse.json(enriched);
   } catch (error) {
     console.warn("Driver list error:", error);
-    return NextResponse.json([]);
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unable to load drivers." }, { status: 500 });
   }
 }

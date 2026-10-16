@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
 type LatLng = { lat: number; lng: number };
-type OsrmRoute = { points: LatLng[]; distance: number; duration: number };
+type RouteDirection = { instruction: string; road: string; distanceMeters: number; durationSeconds: number };
+type OsrmRoute = { points: LatLng[]; distance: number; duration: number; directions: RouteDirection[] };
 const routeCache = new Map<string, OsrmRoute>();
 
 function getLatLng(point: unknown): { lat: number; lng: number } | null {
@@ -82,11 +83,29 @@ async function requestRoute(points: LatLng[]): Promise<OsrmRoute | null> {
       const route = parsedBody?.routes?.[0];
       const geometry = route?.geometry?.coordinates;
       if (!Array.isArray(geometry) || geometry.length < 2) continue;
+      const directions = (route.legs || []).flatMap((leg: any) => (leg.steps || []).map((step: any) => {
+        const maneuver = step.maneuver || {};
+        const type = String(maneuver.type || "continue").replace(/_/g, " ");
+        const modifier = String(maneuver.modifier || "").replace(/_/g, " ");
+        const road = String(step.name || "").trim();
+        const instruction = type === "depart"
+          ? `Start${road ? ` on ${road}` : " route"}`
+          : type === "arrive"
+            ? "Arrive at destination"
+            : `${type}${modifier ? ` ${modifier}` : ""}${road ? ` onto ${road}` : ""}`;
+        return {
+          instruction: instruction.charAt(0).toUpperCase() + instruction.slice(1),
+          road,
+          distanceMeters: Number(step.distance || 0),
+          durationSeconds: Number(step.duration || 0),
+        };
+      }));
 
       const parsedRoute = {
         points: geometry.map(([lng, lat]: [number, number]) => ({ lat, lng })),
         distance: Number(route.distance || 0),
         duration: Number(route.duration || 0),
+        directions,
       };
       routeCache.set(cacheKey, parsedRoute);
       return parsedRoute;
@@ -105,13 +124,13 @@ export async function POST(request: NextRequest) {
 
     if (invalid.length > 0) {
       return NextResponse.json({
-        error: invalid[0].reason,
+        error: "Resolve the selected address before calculating directions.",
         invalidStops: invalid,
       }, { status: 400 });
     }
 
     if (points.length < 2) {
-      return NextResponse.json({ error: "Two valid route coordinates are required" }, { status: 400 });
+      return NextResponse.json({ error: "Resolve at least two valid route points before calculating directions." }, { status: 400 });
     }
 
     const deduped = points.filter((point, index) => {
@@ -123,9 +142,8 @@ export async function POST(request: NextRequest) {
     const route = await requestRoute(deduped);
     if (!route) {
       return NextResponse.json({
-        error: "OSRM could not route the complete route. The request contained invalid or unusable coordinates.",
-        coordinates: deduped,
-        pointsCount: deduped.length,
+        error: "Road directions are unavailable for one or more selected locations. Choose a nearby address or adjust the stops.",
+        hint: "The route server could not compute a valid road path for the selected waypoints.",
       }, { status: 502 });
     }
 
@@ -133,6 +151,8 @@ export async function POST(request: NextRequest) {
       polyline: route.points,
       distanceKm: Number((route.distance / 1000).toFixed(2)),
       durationMin: Math.ceil(route.duration / 60),
+      directions: route.directions,
+      routingProfile: "driving",
     });
   } catch (error) {
     console.error("OSRM request failed or timed out:", error);

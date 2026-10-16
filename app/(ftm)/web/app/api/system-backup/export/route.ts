@@ -2,7 +2,6 @@ import "server-only";
 import { NextResponse } from "next/server";
 import * as XLSX from "xlsx";
 import { authenticateFtmRequest } from "../../../lib/server/ftmRequestAuth";
-import { createFtmParcelClient } from "../../../lib/server/ftmSupabase";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,13 +14,6 @@ const BACKUP_TABLES = [
   "route_plan_parcels", "route_plans", "tracking_history", "trip_statistics", "trip_stops", "trips", "users", "vehicles",
   "vehicle_documents", "vehicle_gps_tracking",
 ];
-
-function parcelDatabaseConfigured() {
-  const url = process.env.FTM_PARCELS_SUPABASE_URL || process.env.PARCELS_SUPABASE_URL;
-  const key = process.env.FTM_PARCELS_SUPABASE_SERVICE_ROLE_KEY || process.env.PARCELS_SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.FTM_PARCELS_SUPABASE_ANON_KEY || process.env.PARCELS_SUPABASE_ANON_KEY;
-  return Boolean(url && key);
-}
 
 async function readAllRows(supabase: any, table: string) {
   const rows: Record<string, any>[] = [];
@@ -60,19 +52,6 @@ export async function GET(request: Request) {
       if (!result.skipped) {
         tables[table] = result.rows;
         tableStatus[table] = "Included";
-      }
-    }
-
-    if (parcelDatabaseConfigured()) {
-      const parcelSupabase = createFtmParcelClient();
-      if (parcelSupabase) {
-        for (const [sourceTable, backupName] of [["parcels", "parcel_parcels"], ["inventory_items", "parcel_inventory_items"]]) {
-          const result = await readAllRows(parcelSupabase, sourceTable);
-          if (!result.skipped) {
-            tables[backupName] = result.rows;
-            tableStatus[backupName] = "Included from configured parcel database";
-          }
-        }
       }
     }
 

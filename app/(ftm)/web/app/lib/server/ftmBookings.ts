@@ -1,7 +1,7 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-type RecordValue = Record<string, any>;
+type RecordValue = Record<string, unknown>;
 
 export function normalizeBooking(record: RecordValue = {}) {
   return {
@@ -58,7 +58,7 @@ function normalizeStatus(value: unknown) {
 }
 
 function isUnavailable(value: unknown) {
-  return ["maintenance", "out of service", "unavailable", "inactive"].includes(normalizeStatus(value));
+  return ["maintenance", "undermaintenance", "underrepair", "outofservice", "unavailable", "inactive", "breakdown", "unsafe", "urgentinspectionrequired"].includes(normalizeStatus(value));
 }
 
 function isActiveTrip(value: unknown) {

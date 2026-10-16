@@ -118,6 +118,8 @@ export default function VrdsDashboardPage() {
   const [dashboardScope, setDashboardScope] = useState<"active" | "archived" | "all">("active");
   const [snapshot, setSnapshot] = useState<VrdsDashboardSnapshot>({ vehicles: [], trips: [], bookings: [], drivers: [] });
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const { parcels: storeParcels } = useParcelStore({ history: true });
 
   useEffect(() => {
@@ -197,8 +199,12 @@ export default function VrdsDashboardPage() {
             drivers: drivers.length,
           },
         });
+        setLoadError(null);
       })
-      .catch((error: unknown) => console.error("Failed to load fleet snapshot:", error))
+      .catch((error: unknown) => {
+        console.error("Failed to load fleet snapshot:", error);
+        if (active) setLoadError(error instanceof Error ? error.message : "Unable to load fleet records.");
+      })
       .finally(() => {
         if (active) setLoading(false);
       });
@@ -210,7 +216,7 @@ export default function VrdsDashboardPage() {
       active = false;
       window.clearInterval(intervalId);
     };
-  }, []);
+  }, [reloadKey]);
 
   const vehicles = (snapshot.vehicles ?? []).map((vehicle) => ({
     ...vehicle,
@@ -304,21 +310,7 @@ export default function VrdsDashboardPage() {
       },
     },
     ...listCourierWarehouses().map((warehouse) => {
-      const courierImage = warehouse.courier === "JNT Express"
-        ? "/images/partners/jnt.png"
-        : warehouse.courier === "ShopeeXpress"
-          ? "/images/partners/shopee.png"
-          : warehouse.courier === "Lazada Express"
-            ? "/images/partners/lazada.png"
-            : warehouse.courier === "Flash Express"
-              ? "/images/partners/flash.png"
-              : warehouse.courier === "TikTok Delivery"
-                ? "/images/partners/tiktok.png"
-                : warehouse.courier === "LBC"
-                  ? "/images/partners/lbc.png"
-                  : warehouse.courier === "GOGO Xpress"
-                    ? "/images/partners/gogo.png"
-                    : "/airship-logo.png";
+      const courierImage = "/images/airship.png";
       return {
         id: `warehouse-${warehouse.id}`,
         position: { lat: warehouse.lat, lng: warehouse.lng },
@@ -519,6 +511,7 @@ export default function VrdsDashboardPage() {
 
         {/* Main Full-Width Dashboard Container */}
         <main className="flex-1 w-full max-w-[1850px] mx-auto px-4 sm:px-6 lg:px-10 py-6 space-y-6">
+          {loadError && <div role="alert" className="flex flex-col gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-800 sm:flex-row sm:items-center sm:justify-between"><span>Fleet data could not be refreshed: {loadError}</span><button type="button" onClick={() => { setLoading(true); setReloadKey((value) => value + 1); }} className="rounded-md border border-rose-300 bg-white px-2.5 py-1.5 text-[10px] font-bold hover:bg-rose-100">Retry</button></div>}
 
           {/* Top Header Banner */}
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white/80 backdrop-blur-md rounded-2xl p-6 border border-pink-100 shadow-sm shadow-pink-500/5">

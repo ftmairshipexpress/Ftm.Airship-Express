@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { NextResponse } from "next/server";
 import { authenticateFtmRequest } from "../../../lib/server/ftmRequestAuth";
 
 export const runtime = "nodejs";
@@ -8,8 +7,8 @@ export const maxDuration = 60;
 
 export async function GET(request: Request) {
   const auth = await authenticateFtmRequest(request);
-  if (!("context" in auth)) return auth.response;
-  const { context } = auth;
+  if (!("context" in auth) || !auth.context) return auth.response;
+  const context = auth.context;
   const encoder = new TextEncoder();
   let closeStream = () => undefined;
 
@@ -23,27 +22,48 @@ export async function GET(request: Request) {
         }
       };
       const ping = setInterval(() => send("ping", { time: Date.now() }), 25000);
-      const channel = context.serviceClient
+      const tripChannel = context.serviceClient
         .channel(`ftm-assignment-events-${randomUUID()}`)
         .on("postgres_changes", { event: "*", schema: "public", table: "trips" }, (payload) => {
           const trip = payload.new as Record<string, unknown> | undefined;
           if (!trip) return;
           if (context.user.role === "driver" && String(trip.driver_id || "") !== context.user.id) return;
           send("assignment", { type: "assignment", trip });
+          const oldTrip = payload.old as Record<string, unknown> | undefined;
+          const previousStatus = String(oldTrip?.status || "").toLowerCase().replace(/[_-]+/g, " ");
+          const currentStatus = String(trip.status || "").toLowerCase().replace(/[_-]+/g, " ");
+          const acceptedTransition = /assigned|pending|dispatch/.test(previousStatus)
+            && /scheduled|accepted|in transit|active/.test(currentStatus);
+          const acceptedUpdateWithoutOldStatus = payload.eventType === "UPDATE"
+            && !previousStatus
+            && /scheduled|accepted/.test(currentStatus)
+            && Boolean(trip.driver_id && trip.vehicle_id);
+          if (acceptedTransition || acceptedUpdateWithoutOldStatus) {
+            send("accepted", { trip_id: trip.id });
+          }
         });
+      const trackingChannels = ["mobile_device_tracking", "driver_tracking", "vehicle_gps_tracking"].map((table) =>
+        context.serviceClient
+          .channel(`ftm-mission-tracking-${table}-${randomUUID()}`)
+          .on("postgres_changes", { event: "*", schema: "public", table }, () => send("tracking", { updated: true }))
+      );
+      const channels = [tripChannel, ...trackingChannels];
 
       let closed = false;
       closeStream = () => {
         if (closed) return;
         closed = true;
         clearInterval(ping);
-        void context.serviceClient.removeChannel(channel);
+        channels.forEach((channel) => void context.serviceClient.removeChannel(channel));
         try { controller.close(); } catch { /* Stream may already be closed by the runtime. */ }
       };
       request.signal.addEventListener("abort", closeStream, { once: true });
-      void channel.subscribe((status) => {
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") send("error", { message: "Assignment updates are temporarily unavailable." });
-      });
+      channels.forEach((channel) => void channel.subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          send("error", { message: "Live updates are temporarily unavailable." });
+          send("tracking_error", { message: "Live location updates are temporarily unavailable." });
+        }
+      }));
     },
     cancel() {
       closeStream();

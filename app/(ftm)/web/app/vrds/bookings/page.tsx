@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, PanelLeftOpen, RefreshCw, Truck, UserRound, X } from "lucide-react";
 import GlobalNavbar from "../../components/GlobalNavbar";
 import GlobalFooter from "../../components/GlobalFooter";
 import { SkeletonTable } from "../../components/PageSkeleton";
@@ -11,8 +12,64 @@ import {
   assignDriverAndVehicle,
   confirmDispatch,
 } from "../../lib/parcelStore";
-import { Booking, BOOKING_STATUS_LABEL } from "../../lib/parcelTypes";
-import { assignBookingResources, createTrip, getRoutePlan } from "../../lib/api";
+import { Booking, BOOKING_STATUS_LABEL, Parcel, RoutePlanPoint } from "../../lib/parcelTypes";
+import { assignBookingResources, createTrip, fetchJson, getRoutePlan } from "../../lib/api";
+
+type ResourceRecord = Record<string, unknown> & { id: string };
+type AssignmentTripRecord = {
+  driver_id?: string | null;
+  driverId?: string | null;
+  vehicle_id?: string | null;
+  vehicleId?: string | null;
+  status?: string | null;
+};
+type ResourceCategory = "vehicles" | "drivers";
+type ResourceStatus = "Available" | "Assigned" | "In Use" | "Unavailable";
+
+const RESOURCE_STATUSES: ResourceStatus[] = ["Available", "Assigned", "In Use", "Unavailable"];
+const ACTIVE_TRIP_STATUSES = new Set([
+  "assigned", "accepted", "pickup assigned", "pickup confirmed", "driver assigned", "vehicle assigned",
+  "scheduled", "dispatching", "dispatched", "in transit", "delivering", "en route", "active", "moving", "delayed", "late",
+]);
+
+function isActiveTripStatus(value: unknown) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  return ACTIVE_TRIP_STATUSES.has(normalized);
+}
+
+function resourceValue(resource: ResourceRecord, ...keys: string[]) {
+  for (const key of keys) {
+    const value = resource[key];
+    if (value != null && String(value).trim()) return value;
+  }
+  return null;
+}
+
+function resourceDisplayValue(value: unknown) {
+  return value == null || value === "" ? "Not recorded" : String(value);
+}
+
+function resourceStatus(resource: ResourceRecord, category: ResourceCategory, bookings: Booking[], trips: AssignmentTripRecord[] = []): ResourceStatus {
+  const statusValues = [resource.status, resource.availability, resource.assignment_status, resource.state]
+    .filter(Boolean).map((value) => String(value).trim().toLowerCase().replace(/[_-]+/g, " "));
+  if ((category === "drivers" && resource.is_active === false) || statusValues.some((value) => /unavailable|inactive|maintenance|out of service|disabled/.test(value))) return "Unavailable";
+  const activeTrip = trips.find((trip) => {
+    const tripResourceId = category === "drivers" ? trip.driver_id || trip.driverId : trip.vehicle_id || trip.vehicleId;
+    return String(tripResourceId || "") === resource.id && isActiveTripStatus(trip.status);
+  });
+  if (activeTrip) return /in transit|delivering|dispatched|dispatching|en route|active|moving|delayed|late/i.test(String(activeTrip.status || "")) ? "In Use" : "Assigned";
+  if (statusValues.some((value) => /in use|busy|in transit|working|on trip/.test(value))) return "In Use";
+  const linkedBookings = bookings.filter((booking) => {
+    const matchesResource = category === "drivers"
+      ? String(booking.driverId || booking.driver_id || "") === resource.id
+      : String(booking.vehicleId || booking.vehicle_id || "") === resource.id;
+    return matchesResource && String(booking.status || "").toUpperCase() !== "CANCELLED";
+  });
+  if (linkedBookings.some((booking) => String(booking.status || "").toUpperCase() === "DISPATCHED")) return "In Use";
+  if (statusValues.some((value) => /assigned|reserved/.test(value)) || linkedBookings.length > 0) return "Assigned";
+  if (statusValues.some((value) => /available|ready|active/.test(value))) return "Available";
+  return "Unavailable";
+}
 
 /* Custom Lightweight SVG Icons */
 function IconCheckCircle({ className = "w-4 h-4" }: { className?: string }) {
@@ -149,8 +206,92 @@ function HeaderMetricCard({
 const STATUS_OPTIONS = ["All", "PENDING", "DRIVER_VEHICLE_ASSIGNED"] as const;
 type BookingStatusFilter = (typeof STATUS_OPTIONS)[number];
 
+function SummaryCard({ label, value }: { label: string; value: string }) {
+  return <div className="min-w-0 rounded-lg border border-slate-200 bg-white px-2.5 py-2"><span className="block truncate text-[9px] font-bold uppercase tracking-wider text-slate-400">{label}</span><span className="mt-1 block truncate text-[11px] font-semibold text-slate-800">{value}</span></div>;
+}
+
+function routePlanDetails(booking?: Booking | null) {
+  return booking?.routePlan?.routeDetails ?? booking?.routePlan?.route_details ?? {};
+}
+
+function routePlanName(booking?: Booking | null) {
+  return routePlanDetails(booking).route_name || booking?.routePlan?.route_name || "Route plan";
+}
+
+function routePlanSequence(booking: Booking): RoutePlanPoint[] {
+  const plan = booking.routePlan;
+  const details = routePlanDetails(booking);
+  const destinations = plan?.deliveryDestinations ?? plan?.delivery_destinations ?? booking.deliveryDestinations ?? [];
+  const origin = details.origin || {
+    name: plan?.pickupLocation || plan?.pickup_location || "Pickup location",
+    address: plan?.pickupLocation || plan?.pickup_location || "",
+    lat: plan?.pickupLatitude ?? plan?.pickup_latitude,
+    lng: plan?.pickupLongitude ?? plan?.pickup_longitude,
+  };
+  const fallbackDestination = destinations[destinations.length - 1];
+  const intermediateStops = details.stops?.length ? details.stops : destinations.slice(0, -1);
+  const destination = details.destination || fallbackDestination;
+  return [origin, ...intermediateStops, ...(destination ? [destination] : [])].filter((point) => Boolean(point?.name || point?.address));
+}
+
+function bookingParcelWeight(booking: Booking, bookingParcels: Parcel[]) {
+  const parcelWeight = bookingParcels.reduce((total, parcel) => total + (Number(parcel.weightKg) || 0), 0);
+  if (parcelWeight > 0) return parcelWeight;
+  const estimatedRouteWeight = Number(routePlanDetails(booking).estimated_load_kg || 0);
+  return estimatedRouteWeight > 0 ? estimatedRouteWeight : Number(booking.totalWeightKg) || 0;
+}
+
+function formatRouteDate(value?: string | null) {
+  if (!value) return "Not scheduled";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("en-PH", { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
 export default function VrdsBookingsPage() {
-  const { bookings, parcels, drivers, vehicles, ready } = useParcelStore();
+  const { bookings, parcels, drivers, vehicles, ready } = useParcelStore({ history: true });
+  const routeBookingSelectionHandled = useRef(false);
+  const [resourceDirectoryOpen, setResourceDirectoryOpen] = useState(true);
+  const [mobileResourceOpen, setMobileResourceOpen] = useState(false);
+  const [resourceCategory, setResourceCategory] = useState<ResourceCategory | null>("vehicles");
+  const [resourceStatusFilter, setResourceStatusFilter] = useState<ResourceStatus | "All">("Available");
+  const [resourceSearch, setResourceSearch] = useState("");
+  const [selectedResource, setSelectedResource] = useState<{ category: ResourceCategory; resource: ResourceRecord } | null>(null);
+  const [resourceDrivers, setResourceDrivers] = useState<ResourceRecord[]>([]);
+  const [resourceVehicles, setResourceVehicles] = useState<ResourceRecord[]>([]);
+  const [resourceTrips, setResourceTrips] = useState<AssignmentTripRecord[]>([]);
+  const [resourceLoading, setResourceLoading] = useState(true);
+  const [resourceError, setResourceError] = useState("");
+  const [resourceUpdatedAt, setResourceUpdatedAt] = useState<Date | null>(null);
+
+  const refreshResourceDirectory = useCallback(async (silent = false) => {
+    if (!silent) setResourceLoading(true);
+    const [driverResult, vehicleResult, tripResult] = await Promise.allSettled([
+      fetchJson("/api/drivers", { cache: "no-store" }),
+      fetchJson("/api/vehicles", { cache: "no-store" }),
+      fetchJson("/api/trips?light=true", { cache: "no-store" }),
+    ]);
+    const errors: string[] = [];
+    if (driverResult.status === "fulfilled" && Array.isArray(driverResult.value)) setResourceDrivers(driverResult.value as ResourceRecord[]);
+    else if (driverResult.status === "rejected") errors.push(driverResult.reason instanceof Error ? driverResult.reason.message : "Unable to load drivers.");
+    if (vehicleResult.status === "fulfilled" && Array.isArray(vehicleResult.value)) setResourceVehicles(vehicleResult.value as ResourceRecord[]);
+    else if (vehicleResult.status === "rejected") errors.push(vehicleResult.reason instanceof Error ? vehicleResult.reason.message : "Unable to load vehicles.");
+    if (tripResult.status === "fulfilled" && Array.isArray(tripResult.value)) setResourceTrips(tripResult.value as AssignmentTripRecord[]);
+    else if (tripResult.status === "rejected") errors.push(tripResult.reason instanceof Error ? tripResult.reason.message : "Unable to verify active trips.");
+    setResourceError(errors.join(" "));
+    setResourceUpdatedAt(new Date());
+    setResourceLoading(false);
+  }, []);
+
+  useEffect(() => {
+    void refreshResourceDirectory();
+    const intervalId = window.setInterval(() => void refreshResourceDirectory(true), 30_000);
+    const onFocus = () => void refreshResourceDirectory(true);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [refreshResourceDirectory]);
 
   const availableDrivers = useMemo(
     () => drivers.filter((driver) => driver.status === "Available"),
@@ -160,6 +301,27 @@ export default function VrdsBookingsPage() {
     () => vehicles.filter((vehicle) => vehicle.status === "Available"),
     [vehicles]
   );
+  const directoryRecords = resourceCategory === "drivers" ? resourceDrivers : resourceVehicles;
+  const directoryStatusCounts = useMemo(() => {
+    const records = resourceCategory === "drivers" ? resourceDrivers : resourceVehicles;
+    return Object.fromEntries(RESOURCE_STATUSES.map((status) => [
+      status,
+      records.filter((resource) => resourceStatus(resource, resourceCategory || "vehicles", bookings, resourceTrips) === status).length,
+    ])) as Record<ResourceStatus, number>;
+  }, [bookings, resourceCategory, resourceDrivers, resourceTrips, resourceVehicles]);
+  const filteredDirectoryRecords = useMemo(() => {
+    const term = resourceSearch.trim().toLowerCase();
+    return directoryRecords.filter((resource) => {
+      if (resourceStatusFilter !== "All" && resourceStatus(resource, resourceCategory || "vehicles", bookings, resourceTrips) !== resourceStatusFilter) return false;
+      if (!term) return true;
+      const haystack = [
+        resource.id, resource.name, resource.full_name, resource.plate, resource.plate_number,
+        resource.model, resource.vehicle_type, resource.type, resource.email, resource.phone,
+        resource.courier, resource.courier_name,
+      ].filter(Boolean).join(" ").toLowerCase();
+      return haystack.includes(term);
+    });
+  }, [bookings, directoryRecords, resourceCategory, resourceSearch, resourceStatusFilter, resourceTrips]);
 
   const courierMatches = (assignedCourier: string | undefined, shipmentCourier: string) => {
     if (!shipmentCourier) return true;
@@ -248,6 +410,21 @@ export default function VrdsBookingsPage() {
   const [isDriverOver, setIsDriverOver] = useState(false);
   const [isVehicleOver, setIsVehicleOver] = useState(false);
 
+  useEffect(() => {
+    if (!ready || routeBookingSelectionHandled.current) return;
+    const bookingId = new URLSearchParams(window.location.search).get("bookingId");
+    if (!bookingId) {
+      routeBookingSelectionHandled.current = true;
+      return;
+    }
+    const booking = bookings.find((item) => String(item.id) === bookingId);
+    if (!booking) return;
+    routeBookingSelectionHandled.current = true;
+    setSelectedBookingId(booking.id);
+    setAssignmentStep("driver");
+    setIsDetailsModalOpen(true);
+  }, [bookings, ready]);
+
   const openBookings = useMemo(
     () => bookings.filter((b) => b.status === "PENDING" || b.status === "DRIVER_VEHICLE_ASSIGNED"),
     [bookings]
@@ -268,20 +445,24 @@ export default function VrdsBookingsPage() {
   const getBookingRouteLabel = useCallback((booking: Booking, parcelList: typeof parcels = parcels) => {
     const genericLabelPattern = /selected delivery destinations|route preview|airship express hub.*binondo/i;
     const normalized = booking.routeLabel || "";
-    if (!genericLabelPattern.test(normalized)) {
-      return normalized || "Airship Express Hub - Binondo, Manila";
-    }
+    const details = routePlanDetails(booking);
+    const routeName = details.route_name || booking.routePlan?.route_name;
+    const sequence = routePlanSequence(booking);
+    const routeSummary = sequence.length > 1
+      ? `${sequence[0].name || sequence[0].address} → ${sequence[sequence.length - 1].name || sequence[sequence.length - 1].address}`
+      : normalized;
+    if (!genericLabelPattern.test(normalized)) return routeName ? `${routeName} · ${routeSummary || normalized}` : normalized || "Airship Express Hub - Binondo, Manila";
 
     const routeParcels = parcelList.filter((parcel) => parcel.bookingId === booking.id);
     const addresses = routeParcels
       .map((parcel) => parcel.destinationAddress)
       .filter((value): value is string => Boolean(value && value.trim()));
 
-    if (addresses.length > 0) {
-      return `Airship Express Hub - Binondo, Manila → ${addresses.slice(0, 3).join(" • ")}`;
-    }
+    const routeLabel = routeSummary || (addresses.length > 0
+      ? `Airship Express Hub - Binondo, Manila → ${addresses.slice(0, 3).join(" • ")}`
+      : "Airship Express Hub - Binondo, Manila → Route destinations");
 
-    return "Airship Express Hub - Binondo, Manila → Route destinations";
+    return routeName ? `${routeName} · ${routeLabel}` : routeLabel;
   }, [parcels]);
 
   const visibleBookings = routeOptimizedBookings.length > 0 ? routeOptimizedBookings : openBookings;
@@ -307,6 +488,11 @@ export default function VrdsBookingsPage() {
   const selectedBooking = selectedBookingId && bookingsById[selectedBookingId]
     ? bookingsById[selectedBookingId]
     : filteredBookings[0] ?? null;
+  const selectedBookingParcels = selectedBooking ? parcels.filter((parcel) => parcel.bookingId === selectedBooking.id) : [];
+  const selectedBookingWeightKg = selectedBooking ? bookingParcelWeight(selectedBooking, selectedBookingParcels) : 0;
+  const selectedRoutePlan = selectedBooking?.routePlan;
+  const selectedRouteDetails = routePlanDetails(selectedBooking);
+  const selectedRouteSequence = selectedBooking ? routePlanSequence(selectedBooking) : [];
 
   const assignedBookings = openBookings.filter((booking) => booking.driverId && booking.vehicleId).length;
 
@@ -326,6 +512,25 @@ export default function VrdsBookingsPage() {
   };
 
   const handleGenerateAssignment = async (booking: Booking) => {
+    let tripRows: AssignmentTripRecord[];
+    try {
+      const response = await fetchJson("/api/trips?light=true", { cache: "no-store" });
+      if (!Array.isArray(response)) throw new Error("Trip availability could not be verified.");
+      tripRows = response as AssignmentTripRecord[];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to verify current trip assignments.";
+      setErrorFor({ id: booking.id, message });
+      setAssignmentErrorModal({ isOpen: true, message });
+      return;
+    }
+
+    setResourceTrips(tripRows);
+    const activeTrips = tripRows.filter((trip) => isActiveTripStatus(trip.status));
+    const activeDriverIds = new Set(activeTrips.map((trip) => String(trip.driver_id || trip.driverId || "")).filter(Boolean));
+    const activeVehicleIds = new Set(activeTrips.map((trip) => String(trip.vehicle_id || trip.vehicleId || "")).filter(Boolean));
+    const eligibleAvailableDrivers = availableDrivers.filter((driver) => !activeDriverIds.has(String(driver.id)));
+    const eligibleAvailableVehicles = availableVehicles.filter((vehicle) => !activeVehicleIds.has(String(vehicle.id)));
+
     console.log("[DEBUG] handleGenerateAssignment called with booking:", {
       bookingId: booking.id,
       parcelsCount: parcels.length,
@@ -339,9 +544,7 @@ export default function VrdsBookingsPage() {
 
     // Calculate actual weight from parcels if booking weight is 0
     const bookingParcels = parcels.filter((p) => p.bookingId === booking.id);
-    const actualWeightKg = bookingParcels.length > 0
-      ? bookingParcels.reduce((sum, p) => sum + (Number(p.weightKg) || 0), 0)
-      : Number(booking.totalWeightKg) || 0;
+    const actualWeightKg = bookingParcelWeight(booking, bookingParcels);
     const hasMeaningfulWeight = Number.isFinite(actualWeightKg) && actualWeightKg > 0;
 
     console.log("[DEBUG] Weight calculation:", {
@@ -362,11 +565,11 @@ export default function VrdsBookingsPage() {
     console.log("[DEBUG] Resolved booking courier:", bookingCourier);
 
     const driverPool = booking.driverId
-      ? drivers.filter((item) => availableDrivers.includes(item) || item.id === booking.driverId)
-      : availableDrivers;
+      ? drivers.filter((item) => !activeDriverIds.has(String(item.id)) && (eligibleAvailableDrivers.includes(item) || item.id === booking.driverId))
+      : eligibleAvailableDrivers;
     const vehiclePool = booking.vehicleId
-      ? vehicles.filter((item) => availableVehicles.includes(item) || item.id === booking.vehicleId)
-      : availableVehicles;
+      ? vehicles.filter((item) => !activeVehicleIds.has(String(item.id)) && (eligibleAvailableVehicles.includes(item) || item.id === booking.vehicleId))
+      : eligibleAvailableVehicles;
     const matchedDrivers = bookingCourier ? driverPool.filter((item) => courierMatches(item.courier, bookingCourier)) : driverPool;
     const matchedVehicles = bookingCourier ? vehiclePool.filter((item) => courierMatches(item.courier, bookingCourier)) : vehiclePool;
     const sameCourierDrivers = booking.courierId
@@ -388,7 +591,7 @@ export default function VrdsBookingsPage() {
       ? candidateDrivers.find((item) => item.id === booking.driverId) ?? candidateDrivers[0]
       : candidateDrivers[0];
 
-    const effectiveVehiclePool = candidateVehicles.length > 0 ? candidateVehicles : availableVehicles;
+    const effectiveVehiclePool = candidateVehicles.length > 0 ? candidateVehicles : eligibleAvailableVehicles;
     const capacityReadyVehicles = hasMeaningfulWeight
       ? effectiveVehiclePool.filter((item) => item.capacityKg >= actualWeightKg)
       : [...effectiveVehiclePool];
@@ -416,10 +619,10 @@ export default function VrdsBookingsPage() {
       selectedVehicle: vehicle ? { id: vehicle.id, plate: vehicle.plate, capacityKg: vehicle.capacityKg } : null,
     });
 
-    const driverUnavailable = !driver || (driver.status !== "Available" && driver.id !== booking.driverId);
+    const driverUnavailable = !driver || activeDriverIds.has(String(driver.id)) || (driver.status !== "Available" && driver.id !== booking.driverId);
     const vehicleUnavailable = hasMeaningfulWeight
-      ? !vehicle || vehicle.capacityKg < actualWeightKg
-      : effectiveVehiclePool.length === 0;
+      ? !vehicle || activeVehicleIds.has(String(vehicle.id)) || vehicle.capacityKg < actualWeightKg
+      : effectiveVehiclePool.length === 0 || Boolean(vehicle && activeVehicleIds.has(String(vehicle.id)));
     const pairMismatch = !sameCourierPair(driver, vehicle, bookingCourier, booking.courierId);
 
     console.log("[DEBUG] Availability check:", {
@@ -741,7 +944,69 @@ export default function VrdsBookingsPage() {
           </div>
         </section>
 
+        <div className="flex items-center justify-between lg:hidden">
+          <button type="button" onClick={() => { setResourceDirectoryOpen(true); setMobileResourceOpen(true); }} className="inline-flex items-center gap-2 rounded-xl border border-rose-100 bg-white px-3.5 py-2.5 text-xs font-bold text-rose-700 shadow-sm transition hover:border-rose-200 hover:bg-rose-50">
+            <Truck className="h-4 w-4" /> Fleet resources
+          </button>
+          <span className="text-[10px] font-medium text-slate-400">{availableVehicles.length} vehicles · {availableDrivers.length} drivers ready</span>
+        </div>
+        {mobileResourceOpen && <button type="button" aria-label="Close fleet resources menu" onClick={() => setMobileResourceOpen(false)} className="fixed inset-0 z-[1249] bg-slate-950/35 backdrop-blur-[2px] lg:hidden" />}
+
+        <div className={`grid items-start gap-5 transition-[grid-template-columns] duration-300 ease-out lg:gap-6 ${resourceDirectoryOpen ? "lg:grid-cols-[minmax(300px,340px)_minmax(0,1fr)]" : "lg:grid-cols-[48px_minmax(0,1fr)]"}`}>
+        {resourceDirectoryOpen ? <aside className={`hide-scrollbar min-w-0 overflow-hidden border border-rose-100/90 bg-white shadow-[0_8px_28px_rgba(190,24,93,0.07)] transition-all duration-300 ${mobileResourceOpen ? "fixed inset-y-0 left-0 z-[1250] w-[min(88vw,360px)] rounded-none" : "hidden rounded-2xl lg:sticky lg:top-4 lg:block"} lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto`}>
+          <div className="border-b border-rose-100 bg-gradient-to-br from-white via-white to-rose-50/70 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="h-1.5 w-1.5 rounded-full bg-rose-500 shadow-[0_0_0_3px_rgba(244,63,94,0.1)]" />
+                  <p className="text-[9px] font-bold uppercase tracking-[0.15em] text-rose-500">Fleet directory</p>
+                </div>
+                <h2 className="mt-1.5 text-sm font-bold text-slate-900">Resources</h2>
+                <p className="mt-0.5 text-[10px] leading-4 text-slate-500">Vehicles and drivers by status</p>
+              </div>
+              <button type="button" onClick={() => void refreshResourceDirectory()} disabled={resourceLoading} aria-label="Refresh fleet resources" title="Refresh resources" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-rose-100 bg-white text-rose-600 transition duration-200 hover:border-rose-200 hover:bg-rose-50 hover:shadow-sm disabled:opacity-50">
+                <RefreshCw className={`h-3.5 w-3.5 ${resourceLoading ? "animate-spin" : ""}`} />
+              </button>
+            </div>
+            <div className="mt-2.5 flex items-center justify-between gap-2">
+              <p className="text-[9px] text-slate-400">{resourceUpdatedAt ? `Updated ${resourceUpdatedAt.toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" })}` : "Syncing fleet data"}</p>
+              <button type="button" aria-expanded={resourceDirectoryOpen} onClick={() => { setResourceDirectoryOpen(false); setMobileResourceOpen(false); }} className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[9px] font-semibold text-slate-500 transition hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300" title="Collapse resource sidebar">
+                Hide <ChevronDown className="h-3 w-3 rotate-90" />
+              </button>
+              <button type="button" onClick={() => setMobileResourceOpen(false)} aria-label="Close fleet resources" className="rounded-md p-1 text-slate-500 transition hover:bg-rose-50 hover:text-rose-700 lg:hidden"><X className="h-3.5 w-3.5" /></button>
+            </div>
+          </div>
+          <div className="border-b border-rose-100 p-3">
+              <p className="mb-1.5 px-1 text-[9px] font-bold uppercase tracking-[0.13em] text-slate-400">Browse category</p>
+              {(["vehicles", "drivers"] as const).map((category) => <button key={category} type="button" aria-pressed={resourceCategory === category} onClick={() => { setResourceCategory(category); setResourceStatusFilter("Available"); }} className={`mb-1 flex w-full items-center justify-between rounded-xl border px-2.5 py-2 text-left transition duration-200 ${resourceCategory === category ? "border-rose-200 bg-rose-50/70 text-rose-700 shadow-[0_2px_8px_rgba(190,24,93,0.07)]" : "border-transparent text-slate-600 hover:border-rose-100 hover:bg-rose-50/40"}`}><span className="flex min-w-0 items-center gap-2"><span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${resourceCategory === category ? "bg-white text-rose-600" : category === "vehicles" ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-500"}`}>{category === "vehicles" ? <Truck className="h-3.5 w-3.5" /> : <UserRound className="h-3.5 w-3.5" />}</span><span className="text-[11px] font-bold">{category === "vehicles" ? "Vehicles" : "Drivers"}</span></span><span className={`min-w-6 rounded-full px-1.5 py-0.5 text-center text-[9px] font-bold ${resourceCategory === category ? "bg-white text-rose-600" : "bg-slate-100 text-slate-500"}`}>{category === "vehicles" ? resourceVehicles.length : resourceDrivers.length}</span></button>)}
+            </div>
+            <div className="min-w-0 p-3">
+              {!resourceCategory ? <div className="flex min-h-36 items-center justify-center rounded-xl border border-dashed border-rose-200 bg-white px-4 text-center text-xs text-slate-500">Choose Vehicles or Drivers to browse fleet records.</div> : <>
+                <div className="mb-2.5 space-y-2">
+                  <div className="flex items-center justify-between px-1"><p className="text-[9px] font-bold uppercase tracking-[0.13em] text-slate-400">Availability</p><span className="text-[9px] font-medium text-slate-400">{resourceCategory === "vehicles" ? "Fleet" : "Team"}</span></div>
+                  <div className="grid grid-cols-2 gap-1 rounded-xl border border-rose-100/80 bg-rose-50/30 p-1" role="tablist" aria-label={`${resourceCategory} status filters`}>
+                    {RESOURCE_STATUSES.map((status) => <button key={status} type="button" role="tab" aria-selected={resourceStatusFilter === status} onClick={() => setResourceStatusFilter(status)} className={`flex min-w-0 items-center justify-between gap-1 rounded-lg px-2 py-1.5 text-[9px] font-semibold transition-colors ${resourceStatusFilter === status ? "bg-rose-600 text-white shadow-sm" : "bg-white/70 text-slate-600 hover:bg-white hover:text-rose-700"}`}><span className="truncate">{status}</span><span className={`shrink-0 text-[9px] tabular-nums ${resourceStatusFilter === status ? "text-rose-100" : "text-slate-400"}`}>{directoryStatusCounts[status]}</span></button>)}
+                  </div>
+                  <label className="relative block min-w-0 w-full"><IconSearch className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" /><input aria-label={`Search ${resourceCategory}`} value={resourceSearch} onChange={(event) => setResourceSearch(event.target.value)} placeholder={resourceCategory === "vehicles" ? "Search plate or model" : "Search name or contact"} className="w-full rounded-lg border border-slate-200/90 bg-white py-2 pl-8 pr-2.5 text-[11px] outline-none transition placeholder:text-slate-400 focus:border-rose-300 focus:ring-2 focus:ring-rose-100" /></label>
+                </div>
+                {resourceError && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"><span>{resourceError}</span><button type="button" onClick={() => void refreshResourceDirectory()} className="font-bold underline">Retry</button></div>}
+                {resourceLoading && resourceVehicles.length === 0 && resourceDrivers.length === 0 ? <div role="status" className="flex min-h-24 items-center justify-center rounded-xl border border-dashed border-slate-200 bg-white text-[11px] text-slate-500">Loading fleet resources…</div> : filteredDirectoryRecords.length === 0 ? <div className="flex min-h-24 flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-white px-3 text-center"><p className="text-[11px] font-semibold text-slate-700">No {resourceStatusFilter.toLowerCase()} {resourceCategory} found</p><p className="mt-1 text-[9px] text-slate-500">Try another status or search.</p></div> : <div className="space-y-1.5 pr-0.5">{filteredDirectoryRecords.map((resource) => {
+                  const status = resourceStatus(resource, resourceCategory, bookings, resourceTrips);
+                  const name = resourceCategory === "drivers" ? resourceDisplayValue(resourceValue(resource, "full_name", "name")) : resourceDisplayValue(resourceValue(resource, "plate_number", "plate", "plateNumber"));
+                  const secondary = resourceCategory === "drivers" ? resourceDisplayValue(resourceValue(resource, "email", "phone")) : [resourceValue(resource, "make"), resourceValue(resource, "model", "vehicle_type", "type")].filter(Boolean).join(" ") || "Vehicle details unavailable";
+                  const statusStyle = status === "Available" ? "bg-emerald-50 text-emerald-700 border-emerald-200" : status === "In Use" ? "bg-amber-50 text-amber-700 border-amber-200" : status === "Assigned" ? "bg-sky-50 text-sky-700 border-sky-200" : "bg-slate-100 text-slate-600 border-slate-200";
+                  return <button key={resource.id} type="button" onClick={() => setSelectedResource({ category: resourceCategory, resource })} className="group flex min-w-0 items-center gap-2.5 rounded-xl border border-rose-100/80 bg-white px-2.5 py-2 text-left shadow-[0_1px_3px_rgba(15,23,42,0.03)] transition duration-150 hover:border-rose-200 hover:bg-rose-50/40 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"><span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${resourceCategory === "vehicles" ? "bg-amber-50 text-amber-700" : "bg-rose-50 text-rose-600"}`}>{resourceCategory === "vehicles" ? <Truck className="h-3.5 w-3.5" /> : <UserRound className="h-3.5 w-3.5" />}</span><span className="min-w-0 flex-1"><span className="block truncate text-[11px] font-bold text-slate-900 group-hover:text-rose-700">{name}</span><span className="mt-0.5 block truncate text-[9px] leading-3 text-slate-500">{secondary}</span><span className="mt-1 block truncate font-mono text-[8px] text-slate-400">ID {resource.id}</span></span><span className={`shrink-0 rounded-full border px-1.5 py-1 text-[8px] font-bold leading-none ${statusStyle}`}>{status}</span></button>;
+                })}</div>}
+              </>}
+            </div>
+        </aside> : <aside className="flex h-12 w-12 items-start justify-center rounded-2xl border border-rose-100/90 bg-white p-1.5 shadow-[0_8px_28px_rgba(190,24,93,0.07)] transition-all duration-300 lg:sticky lg:top-4" aria-label="Collapsed fleet resources sidebar">
+          <button type="button" aria-expanded={false} onClick={() => setResourceDirectoryOpen(true)} aria-label="Show fleet resources" title="Show fleet resources" className="flex h-8 w-8 items-center justify-center rounded-lg text-rose-600 transition hover:bg-rose-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300">
+            <PanelLeftOpen className="h-4 w-4" />
+          </button>
+        </aside>}
+
         {/* Master / Detail Split Grid */}
+        <div className="min-w-0">
         <div className="grid gap-6 lg:grid-cols-12 items-start">
           
           {/* LEFT: Booking Queue List */}
@@ -790,11 +1055,16 @@ export default function VrdsBookingsPage() {
                 {filteredBookings.map((booking) => {
                   const isSelected = selectedBooking?.id === booking.id;
                   const vehicle = vehicles.find((v) => v.id === booking.vehicleId);
-                  const isOverCapacity = vehicle ? booking.totalWeightKg > vehicle.capacityKg : false;
-
                   const currentBookingParcels = parcels.filter((p) => p.bookingId === booking.id);
+                  const displayWeightKg = bookingParcelWeight(booking, currentBookingParcels);
+                  const isOverCapacity = vehicle ? displayWeightKg > vehicle.capacityKg : false;
                   const parcelCount = currentBookingParcels.length || booking.parcelIds.length || booking.parcelCount || 0;
-                  const bookingCourier = booking.courier || currentBookingParcels[0]?.courier || "Unassigned";
+                  const bookingCourier = booking.courier || currentBookingParcels[0]?.courier || booking.routePlan?.courier || "Unassigned";
+                  const bookingRouteDetails = routePlanDetails(booking);
+                  const bookingRouteSequence = booking.routePlan ? routePlanSequence(booking) : [];
+                  const cardIdentifier = booking.routePlanId || /^ROUTE-/i.test(booking.id)
+                    ? (routePlanName(booking) === "Route plan" ? getBookingRouteLabel(booking, parcels) : routePlanName(booking))
+                    : `#${booking.id}`;
 
                   return (
                     <div
@@ -812,7 +1082,7 @@ export default function VrdsBookingsPage() {
                         <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
                           <div className="flex items-center gap-2">
                             <span className="font-mono text-xs font-black text-rose-600 bg-rose-50 border border-rose-100 px-2.5 py-1 rounded-lg">
-                              #{booking.id}
+                              {cardIdentifier}
                             </span>
                             <span className="text-xs font-semibold text-slate-400 flex items-center gap-1">
                               <IconClock className="w-3.5 h-3.5 text-slate-400" />
@@ -849,6 +1119,7 @@ export default function VrdsBookingsPage() {
                               {getBookingRouteLabel(booking, parcels)}
                             </h3>
                           </div>
+                          {(booking.routePlan || booking.routePlanId) && <p className="mt-1 pl-6 text-[10px] text-slate-500"><span className="font-semibold text-slate-700">{routePlanName(booking)}</span>{booking.routePlan && <> · {bookingRouteDetails.route_type || "Custom Route"} · Priority {bookingRouteDetails.priority || "Normal"} · {bookingRouteSequence.length} planned points · Departs {formatRouteDate(bookingRouteDetails.schedule?.depart_at || booking.routePlan.plannedDeliveryDate || booking.routePlan.planned_delivery_date)}</>}</p>}
                         </div>
 
                         {/* Stats Grid */}
@@ -865,7 +1136,7 @@ export default function VrdsBookingsPage() {
                               Total Weight
                             </span>
                             <span className={`text-xs font-bold ${isOverCapacity ? "text-rose-600" : "text-slate-800"}`}>
-                              {booking.totalWeightKg} kg
+                              {displayWeightKg} kg
                             </span>
                           </div>
 
@@ -901,7 +1172,7 @@ export default function VrdsBookingsPage() {
                         {isOverCapacity && (
                           <div className="mt-3 flex items-center gap-2 text-xs font-semibold text-rose-700 bg-rose-50 border border-rose-200 px-3 py-2 rounded-xl">
                             <IconAlert className="w-4 h-4 shrink-0 text-rose-600" />
-                            <span>Weight ({booking.totalWeightKg}kg) exceeds vehicle max payload ({vehicle?.capacityKg}kg)</span>
+                            <span>Weight ({displayWeightKg}kg) exceeds vehicle max payload ({vehicle?.capacityKg}kg)</span>
                           </div>
                         )}
                       </div>
@@ -1049,11 +1320,11 @@ export default function VrdsBookingsPage() {
                         </span>
                       </div>
 
-                      {/* Route Plan ID */}
+                      {/* Route Plan Name */}
                       <div>
-                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Route Plan ID</span>
-                        <span className="font-mono text-xs font-semibold text-slate-700 bg-slate-100 px-2.5 py-1.5 rounded-lg block truncate">
-                          {selectedBooking.routePlanId || "N/A"}
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Route Plan</span>
+                        <span className="text-xs font-semibold text-slate-700 bg-slate-100 px-2.5 py-1.5 rounded-lg block truncate">
+                          {routePlanName(selectedBooking)}
                         </span>
                       </div>
                     </div>
@@ -1066,6 +1337,13 @@ export default function VrdsBookingsPage() {
                         <p className="text-xs text-slate-700 leading-relaxed">{getBookingRouteLabel(selectedBooking, parcels)}</p>
                       </div>
                     </div>
+                    {selectedRoutePlan && <div className="mt-3 space-y-3 border-t border-slate-200 pt-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2"><div><h4 className="text-sm font-bold text-slate-900">{selectedRouteDetails.route_name || selectedRoutePlan.route_name || "Route plan"}</h4><p className="mt-0.5 text-[10px] text-slate-500">{selectedRouteDetails.route_type || "Custom Route"} · Priority {selectedRouteDetails.priority || "Normal"}</p></div><span className="rounded-full border border-rose-100 bg-rose-50 px-2.5 py-1 text-[10px] font-bold text-rose-700">{String(selectedRoutePlan.status || "Planned").replace(/_/g, " ")}</span></div>
+                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6"><SummaryCard label="Distance" value={`${Number(selectedRoutePlan.optimizedDistanceKm ?? selectedRoutePlan.optimized_distance_km ?? selectedRoutePlan.distanceKm ?? selectedRoutePlan.distance_km ?? 0).toFixed(1)} km`} /><SummaryCard label="Travel time" value={`${Math.round(Number(selectedRoutePlan.optimizedDurationMinutes ?? selectedRoutePlan.optimized_duration_min ?? selectedRoutePlan.durationMinutes ?? selectedRoutePlan.estimated_duration_min ?? selectedRouteDetails.schedule?.duration_minutes ?? 0))} min`} /><SummaryCard label="Departure" value={formatRouteDate(selectedRouteDetails.schedule?.depart_at || selectedRoutePlan.plannedDeliveryDate || selectedRoutePlan.planned_delivery_date)} /><SummaryCard label="Expected arrival" value={formatRouteDate(selectedRouteDetails.schedule?.expected_arrival)} /><SummaryCard label="Vehicle class" value={selectedRouteDetails.vehicle_type || "Not specified"} /><SummaryCard label="Planned load" value={`${Number(selectedRouteDetails.estimated_load_kg || 0).toFixed(1)} kg`} /></div>
+                      {(selectedRouteDetails.schedule?.window_start || selectedRouteDetails.schedule?.window_end) && <p className="text-[10px] text-slate-600"><b>Delivery window:</b> {formatRouteDate(selectedRouteDetails.schedule?.window_start)} – {formatRouteDate(selectedRouteDetails.schedule?.window_end)}</p>}
+                      <div><h5 className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">Planned stop sequence</h5><ol className="space-y-2">{selectedRouteSequence.map((point, index) => <li key={`${point.id || point.name || point.address}-${index}`} className="flex gap-2 rounded-lg border border-slate-200 bg-white p-2.5"><span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-rose-50 text-[10px] font-bold text-rose-700">{index + 1}</span><div className="min-w-0 flex-1"><p className="text-xs font-semibold text-slate-800">{point.name || point.address || `Stop ${index + 1}`}{point.purpose ? <span className="font-normal text-slate-500"> · {point.purpose}</span> : null}</p>{point.address && <p className="mt-0.5 break-words text-[10px] text-slate-600">{point.address}</p>}<div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[9px] text-slate-500">{(point.lat ?? point.latitude) != null && (point.lng ?? point.longitude) != null && <span>{Number(point.lat ?? point.latitude).toFixed(5)}, {Number(point.lng ?? point.longitude).toFixed(5)}</span>}{point.arrival && <span>Arrive {formatRouteDate(point.arrival)}</span>}{point.departure && <span>Depart {formatRouteDate(point.departure)}</span>}{point.durationMinutes != null && <span>{point.durationMinutes} min stop</span>}</div>{point.instructions && <p className="mt-1 text-[10px] text-slate-600">{point.instructions}</p>}{point.parcelReference && <p className="mt-1 text-[10px] font-semibold text-rose-700">Parcels: {point.parcelReference}</p>}</div></li>)}</ol></div>
+                      {selectedRouteDetails.notes && <div className="rounded-lg border border-amber-100 bg-amber-50/60 p-3"><h5 className="text-[10px] font-bold uppercase tracking-wider text-amber-800">Route instructions</h5><p className="mt-1 whitespace-pre-wrap text-xs text-slate-700">{selectedRouteDetails.notes}</p></div>}
+                    </div>}
                   </div>
 
                   {/* ASSIGNMENT DETAILS */}
@@ -1109,7 +1387,7 @@ export default function VrdsBookingsPage() {
                       <div>
                         <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Total Weight</span>
                         <span className="text-xs font-bold text-slate-800 px-3 py-2 bg-slate-100 rounded-lg block">
-                          {selectedBooking.totalWeightKg} kg
+                          {selectedBookingWeightKg} kg
                         </span>
                       </div>
 
@@ -1131,15 +1409,15 @@ export default function VrdsBookingsPage() {
                         {(() => {
                           const veh = vehicles.find((v) => v.id === selectedBooking.vehicleId);
                           const cap = veh?.capacityKg || 1;
-                          const ratio = Math.min(Math.round((selectedBooking.totalWeightKg / cap) * 100), 100);
-                          const isOver = selectedBooking.totalWeightKg > cap;
+                          const ratio = Math.min(Math.round((selectedBookingWeightKg / cap) * 100), 100);
+                          const isOver = selectedBookingWeightKg > cap;
 
                           return (
                             <div>
                               <div className="flex justify-between text-xs font-bold mb-2">
                                 <span className="text-slate-600">Payload vs Vehicle Capacity</span>
                                 <span className={isOver ? "text-rose-600 font-black" : "text-slate-800"}>
-                                  {selectedBooking.totalWeightKg} / {cap} kg ({ratio}%)
+                                  {selectedBookingWeightKg} / {cap} kg ({ratio}%)
                                 </span>
                               </div>
                               <div className="w-full bg-slate-200 h-2.5 rounded-full overflow-hidden">
@@ -1171,15 +1449,15 @@ export default function VrdsBookingsPage() {
                       {(() => {
                         const veh = vehicles.find((v) => v.id === selectedBooking.vehicleId);
                         const cap = veh?.capacityKg || 1;
-                        const ratio = Math.min(Math.round((selectedBooking.totalWeightKg / cap) * 100), 100);
-                        const isOver = selectedBooking.totalWeightKg > cap;
+                        const ratio = Math.min(Math.round((selectedBookingWeightKg / cap) * 100), 100);
+                        const isOver = selectedBookingWeightKg > cap;
 
                         return (
                           <div>
                             <div className="flex justify-between text-xs font-bold mb-1.5">
                               <span className="text-slate-600">Payload vs Vehicle Capacity</span>
                               <span className={isOver ? "text-rose-600 font-black" : "text-slate-800"}>
-                                {selectedBooking.totalWeightKg} / {cap} kg ({ratio}%)
+                                  {selectedBookingWeightKg} / {cap} kg ({ratio}%)
                               </span>
                             </div>
                             <div className="w-full bg-slate-200 h-2.5 rounded-full overflow-hidden">
@@ -1320,6 +1598,7 @@ export default function VrdsBookingsPage() {
                             <span>{parcel.trackingNumber}</span>
                             <span className="text-slate-500">{parcel.weightKg} kg</span>
                           </div>
+                          <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500"><span className="font-semibold">{parcel.parcelType}</span><span className="rounded-full bg-rose-50 px-2 py-0.5 font-bold text-rose-700">{String(parcel.status).replace(/_/g, " ")}</span>{parcel.courier && <span>{parcel.courier}</span>}</div>
                           <div className="text-slate-600 font-medium">
                             <span className="text-slate-400">To: </span>
                             {parcel.recipientName} ({parcel.destinationAddress})
@@ -1381,6 +1660,50 @@ export default function VrdsBookingsPage() {
             </div>
           )}
         </div>
+        </div>
+        </div>
+
+        {selectedResource && (() => {
+          const { category, resource } = selectedResource;
+          const status = resourceStatus(resource, category, bookings, resourceTrips);
+          const assignedVehicleId = String(resourceValue(resource, "vehicle_id", "vehicleId") || "");
+          const assignedVehicle = resourceVehicles.find((vehicle) => vehicle.id === assignedVehicleId);
+          const title = category === "vehicles"
+            ? String(resourceValue(resource, "plate_number", "plate", "plateNumber") || resource.id)
+            : String(resourceValue(resource, "full_name", "name") || resource.id);
+          const details: Array<[string, string]> = category === "vehicles" ? [
+            ["Vehicle ID", resource.id],
+            ["Plate number", resourceDisplayValue(resourceValue(resource, "plate_number", "plate", "plateNumber"))],
+            ["Model", resourceDisplayValue(resourceValue(resource, "model", "vehicle_model"))],
+            ["Make", resourceDisplayValue(resourceValue(resource, "make", "manufacturer"))],
+            ["Type", resourceDisplayValue(resourceValue(resource, "vehicle_type", "type", "vehicleType"))],
+            ["Capacity", resourceValue(resource, "capacity_kg", "capacityKg", "capacity") == null ? "Not recorded" : `${resourceValue(resource, "capacity_kg", "capacityKg", "capacity")} kg`],
+            ["Status", status],
+            ["Availability", resourceDisplayValue(resourceValue(resource, "availability", "assignment_status"))],
+            ["Courier", resourceDisplayValue(resourceValue(resource, "courier", "courier_name"))],
+            ["Fuel efficiency", resourceValue(resource, "fuel_efficiency", "fuelEfficiencyKmPerL") == null ? "Not recorded" : `${resourceValue(resource, "fuel_efficiency", "fuelEfficiencyKmPerL")} km/L`],
+            ["Mileage", resourceDisplayValue(resourceValue(resource, "mileage", "odometer"))],
+            ["Last service", resourceDisplayValue(resourceValue(resource, "last_service", "lastService"))],
+            ["Next service", resourceDisplayValue(resourceValue(resource, "next_service", "nextService"))],
+          ] : [
+            ["Driver ID", resource.id],
+            ["Name", resourceDisplayValue(resourceValue(resource, "full_name", "name"))],
+            ["Email", resourceDisplayValue(resourceValue(resource, "email"))],
+            ["Phone", resourceDisplayValue(resourceValue(resource, "phone", "phone_number"))],
+            ["License number", resourceDisplayValue(resourceValue(resource, "license_number", "licenseNumber", "driver_license_number"))],
+            ["License expiry", resourceDisplayValue(resourceValue(resource, "license_expiration", "license_expiry", "licenseExpiry"))],
+            ["Availability", status],
+            ["Courier", resourceDisplayValue(resourceValue(resource, "courier", "courier_name"))],
+            ["Assigned vehicle", assignedVehicle ? String(resourceValue(assignedVehicle, "plate_number", "plate", "plateNumber") || assignedVehicle.id) : assignedVehicleId || "Not assigned"],
+            ["Joined", formatRouteDate(String(resourceValue(resource, "created_at", "createdAt") || ""))],
+          ];
+          return <div className="fixed inset-0 z-[1400] flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedResource(null); }}>
+            <section role="dialog" aria-modal="true" aria-labelledby="resource-detail-title" className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-rose-100 bg-white p-5 shadow-2xl sm:p-6">
+              <header className="mb-4 flex items-start justify-between gap-3 border-b border-slate-100 pb-4"><div className="flex min-w-0 items-center gap-3"><div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${category === "vehicles" ? "bg-amber-50 text-amber-700" : "bg-rose-50 text-rose-700"}`}>{category === "vehicles" ? <IconTruck className="h-5 w-5" /> : <IconUser className="h-5 w-5" />}</div><div className="min-w-0"><p className="text-[10px] font-bold uppercase tracking-wider text-rose-600">{category === "vehicles" ? "Vehicle details" : "Driver details"}</p><h2 id="resource-detail-title" className="truncate text-lg font-bold text-slate-900">{title}</h2></div></div><button type="button" onClick={() => setSelectedResource(null)} aria-label="Close resource details" className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-sm text-slate-500 hover:bg-slate-50">×</button></header>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">{details.map(([label, value]) => <div key={label} className="min-w-0 rounded-xl border border-slate-100 bg-rose-50/30 px-3 py-2.5"><p className="text-[9px] font-bold uppercase tracking-wider text-slate-400">{label}</p><p className="mt-1 break-words text-xs font-semibold text-slate-800">{value}</p></div>)}</div>
+            </section>
+          </div>;
+        })()}
 
         {/* Assignment Error Modal */}
         {loadingBookingId && (

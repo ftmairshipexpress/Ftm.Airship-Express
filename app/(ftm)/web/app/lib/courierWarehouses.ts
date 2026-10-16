@@ -1,9 +1,7 @@
 /**
  * Fixed warehouse marker by courier and city.
  *
- * Each courier has a deterministic warehouse pin in each service city, with no
- * city-centroid or shared-city behavior. The final coordinate is still fixed and
- * hardcoded for the pair (courier, city).
+ * Airship Express has a deterministic warehouse pin in each service city.
  */
 import { COURIER_NAMES, CourierName } from "./parcelTypes";
 import { getCityCoordinate, SERVICE_AREA_CITIES, ServiceAreaCity } from "./serviceAreas";
@@ -69,13 +67,6 @@ const CITY_BASE_WAREHOUSE: Record<ServiceAreaCity, { lat: number; lng: number }>
 };
 
 const COURIER_CITY_OFFSETS: Record<CourierName, { dLat: number; dLng: number }> = {
-  ShopeeXpress: { dLat: 0.0060, dLng: 0.0045 },
-  "JNT Express": { dLat: -0.0055, dLng: 0.0065 },
-  "Lazada Express": { dLat: 0.0050, dLng: -0.0060 },
-  "Flash Express": { dLat: -0.0060, dLng: -0.0045 },
-  "TikTok Delivery": { dLat: 0.0070, dLng: 0.0020 },
-  LBC: { dLat: -0.0020, dLng: 0.0075 },
-  "GOGO Xpress": { dLat: 0.0020, dLng: -0.0070 },
   "Airship Express": { dLat: -0.0075, dLng: -0.0015 },
 };
 
@@ -105,36 +96,10 @@ function buildRegistry() {
 
 const WAREHOUSE_REGISTRY = buildRegistry();
 
-const COURIER_ALIASES: Record<string, CourierName> = {
-  "shopee xpress": "ShopeeXpress",
-  "shopee express": "ShopeeXpress",
-  "j&t express": "JNT Express",
-  "jnt": "JNT Express",
-  "lazada": "Lazada Express",
-  "flash": "Flash Express",
-  "tiktok": "TikTok Delivery",
-  "tiktok express": "TikTok Delivery",
-  "lbc express": "LBC",
-  "gogo": "GOGO Xpress",
-  "gogo express": "GOGO Xpress",
-};
-
-/** Normalize imported courier labels to the warehouse registry key. */
+/** Route warehouse lookups through the only supported courier. */
 export function resolveCourierName(value: unknown): CourierName {
-  const raw = String(value ?? "").trim();
-  if (!raw) return "LBC";
-  const normalized = raw.toLowerCase().replace(/[._-]+/g, " ").replace(/\s+/g, " ");
-  const exact = COURIER_NAMES.find((name) => name.toLowerCase() === normalized);
-  if (exact) return exact;
-  if (COURIER_ALIASES[normalized]) return COURIER_ALIASES[normalized];
-  if (normalized.includes("tiktok")) return "TikTok Delivery";
-  if (normalized.includes("gogo")) return "GOGO Xpress";
-  if (normalized.includes("lbc")) return "LBC";
-  if (normalized.includes("shopee")) return "ShopeeXpress";
-  if (normalized.includes("jnt") || normalized.includes("j&t")) return "JNT Express";
-  if (normalized.includes("lazada")) return "Lazada Express";
-  if (normalized.includes("flash")) return "Flash Express";
-  return "LBC";
+  void value;
+  return "Airship Express";
 }
 
 /** The one fixed warehouse a given courier operates in a given city, or undefined if the city/courier isn't covered. */

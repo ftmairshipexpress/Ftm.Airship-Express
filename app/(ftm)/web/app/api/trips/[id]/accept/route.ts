@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { hasPermission } from "../../../../lib/permissions";
 import { authenticateFtmRequest } from "../../../../lib/server/ftmRequestAuth";
+import { isAirshipCourier } from "../../../../lib/server/ftmCourier";
 import { normalizeTrip, updateRemoteParcelStatus, validateTripAssignment } from "../../../../lib/server/ftmTrips";
 
 export const dynamic = "force-dynamic";
@@ -22,6 +23,7 @@ export async function POST(request: Request, { params }: { params: { id: string 
   if (body.driver_id || trip.driver_id) {
     try {
       const assignment = await validateTripAssignment(supabase, trip, body.driver_id || trip.driver_id);
+      if (!isAirshipCourier(assignment.courier.name || assignment.courier.code)) return NextResponse.json({ error: "Only Airship Express trips can be accepted in VRDS." }, { status: 409 });
       update.driver_id = body.driver_id || trip.driver_id;
       update.driver_name = assignment.driver.full_name || null;
       update.courier_id = assignment.courier.id || trip.courier_id;

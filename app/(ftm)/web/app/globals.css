@@ -15,6 +15,11 @@
   height: 0;
 }
 
+.hide-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
 :root {
   --background: #fcfbf9;
   --foreground: #1c1b1f;

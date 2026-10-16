@@ -21,20 +21,10 @@ type StoreState = {
   vehicles: Vehicle[];
 };
 
-// Default mock drivers for testing when backend is unavailable
-const DEFAULT_DRIVERS: Driver[] = [
-  { id: "drv-001", name: "Airship Express Driver 1", status: "Available" },
-  { id: "drv-002", name: "ShopeeXpress Driver 1", status: "Available" },
-  { id: "drv-003", name: "JNT Driver 1", status: "Available" },
-  { id: "drv-004", name: "Lazada Driver 1", status: "Available" },
-  { id: "drv-005", name: "Flash Driver 1", status: "Available" },
-  { id: "drv-006", name: "LBC Driver 1", status: "Available" },
-];
-
 const DEFAULT_STATE: StoreState = {
   parcels: [],
   bookings: [],
-  drivers: DEFAULT_DRIVERS,
+  drivers: [],
   vehicles: [],
 };
 
@@ -165,7 +155,7 @@ function addMissingBookedParcels(parcels: Parcel[], bookings: Booking[]) {
         destLat: 0,
         destLng: 0,
         parcelType: "E-commerce Package",
-        courier: (normalizeCourierName(booking.courier) ?? "LBC") as CourierName,
+        courier: (normalizeCourierName(booking.courier) ?? "Airship Express") as CourierName,
         weightKg: 0,
         status: "BOOKED",
         receivedAt: booking.createdAt,
@@ -180,40 +170,9 @@ function addMissingBookedParcels(parcels: Parcel[], bookings: Booking[]) {
   return missing.length ? [...parcels, ...missing] : parcels;
 }
 
-const COURIER_CANONICAL_MAP: Record<string, CourierName> = {
-  "Shopee Xpress": "ShopeeXpress",
-  "ShopeeXpress": "ShopeeXpress",
-  "J&T Express": "JNT Express",
-  "J&T Cargo": "JNT Express",
-  "JNT Express": "JNT Express",
-  "Lazada": "Lazada Express",
-  "Lazada Express": "Lazada Express",
-  "Flash Express": "Flash Express",
-  "TikTok Delivery": "TikTok Delivery",
-  "LBC Express": "LBC",
-  "LBC": "LBC",
-  "GOGO Xpress": "GOGO Xpress",
-  "Air21": "Airship Express",
-  "Airship Express": "Airship Express",
-};
-
 function normalizeCourierName(raw: unknown): CourierName | undefined {
   if (raw === null || raw === undefined) return undefined;
-  const value = String(raw).trim();
-  if (!value) return undefined;
-  const normalized = COURIER_CANONICAL_MAP[value];
-  if (normalized) return normalized;
-  const candidate = COURIER_NAMES.find((name) => name.toLowerCase() === value.toLowerCase());
-  if (candidate) return candidate;
-  if (value.toLowerCase().includes("j&t")) return "JNT Express";
-  if (value.toLowerCase().includes("lazada")) return "Lazada Express";
-  if (value.toLowerCase().includes("shopee")) return "ShopeeXpress";
-  if (value.toLowerCase().includes("lbc")) return "LBC";
-  if (value.toLowerCase().includes("gogo")) return "GOGO Xpress";
-  if (value.toLowerCase().includes("flash")) return "Flash Express";
-  if (value.toLowerCase().includes("tiktok")) return "TikTok Delivery";
-  if (value.toLowerCase().includes("airship")) return "Airship Express";
-  return undefined;
+  return /airship/i.test(String(raw)) ? "Airship Express" : undefined;
 }
 
 function normalizeStatusToAvailability(raw: unknown, defaultAvailable = true): 'Available' | 'Assigned' {
@@ -329,6 +288,7 @@ export function useParcelStore(options: { status?: string; history?: boolean } =
     options.status ? { ...state, parcels: [] } : state
   );
   const [ready, setReady] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     const sync = () => setSnapshot(options.status ? { ...state, parcels: [] } : { ...state });
@@ -345,6 +305,14 @@ export function useParcelStore(options: { status?: string; history?: boolean } =
           getParcels(options).catch(() => null),
           getTrips({ light: true }).catch(() => null),
         ]);
+        const sourceErrors = [
+          apiBookings === null ? "Bookings" : null,
+          apiDrivers === null ? "Drivers" : null,
+          apiVehicles === null ? "Vehicles" : null,
+          apiParcels === null ? "Parcels" : null,
+          apiTrips === null ? "Trips" : null,
+        ].filter((source): source is string => Boolean(source));
+        setLoadError(sourceErrors.length ? `Unable to refresh ${sourceErrors.join(", ")}. Showing last available records.` : null);
 
         const normalizedBookings = apiBookings === null
           ? []
@@ -508,10 +476,10 @@ export function useParcelStore(options: { status?: string; history?: boolean } =
         );
 
         const nextState: StoreState = {
-          bookings: Array.isArray(apiBookings) && apiBookings.length === 0 ? state.bookings : dedupeBookings(normalizedBookings),
-          drivers: finalDrivers.length > 0 ? finalDrivers : DEFAULT_DRIVERS,
-          vehicles: finalVehicles,
-          parcels: Array.isArray(apiParcels) && apiParcels.length === 0 ? state.parcels : syncedParcels,
+          bookings: apiBookings === null || (Array.isArray(apiBookings) && apiBookings.length === 0) ? state.bookings : dedupeBookings(normalizedBookings),
+          drivers: apiDrivers === null ? state.drivers : finalDrivers,
+          vehicles: apiVehicles === null ? state.vehicles : finalVehicles,
+          parcels: apiParcels === null || (Array.isArray(apiParcels) && apiParcels.length === 0) ? state.parcels : syncedParcels,
         };
 
         if (options.status) {
@@ -522,8 +490,8 @@ export function useParcelStore(options: { status?: string; history?: boolean } =
           writeState(nextState);
           sync();
         }
-      } catch (e) {
-        // silently ignore hydrate errors in client
+      } catch (error) {
+        setLoadError(error instanceof Error ? error.message : "Unable to load fleet records.");
       }
     })();
 
@@ -535,7 +503,7 @@ export function useParcelStore(options: { status?: string; history?: boolean } =
     };
   }, []);
 
-  return { ...snapshot, ready };
+  return { ...snapshot, ready, error: loadError };
 }
 
 export async function refreshStoreFromBackend(options: { status?: string; history?: boolean } = {}) {
@@ -722,7 +690,7 @@ export async function refreshStoreFromBackend(options: { status?: string; histor
 
     const nextState: StoreState = {
       bookings: dedupeBookings(normalizedBookings),
-      drivers: finalDrivers.length > 0 ? finalDrivers : DEFAULT_DRIVERS,
+      drivers: finalDrivers,
       vehicles: finalVehicles,
       parcels: syncedParcels,
     };
@@ -746,7 +714,7 @@ export function receiveParcel(input: Omit<Parcel, "id" | "trackingNumber" | "sta
     ...input,
     id: makeId("PAR"),
     trackingNumber: makeId("AXP"),
-    courier: input.courier ?? "LBC",
+    courier: input.courier ?? "Airship Express",
     status: "PICKED_UP",
     receivedAt: new Date().toISOString(),
   };

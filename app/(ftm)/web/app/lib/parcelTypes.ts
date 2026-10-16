@@ -11,16 +11,7 @@ export const PARCEL_TYPES = [
 ] as const;
 
 export type ParcelType = (typeof PARCEL_TYPES)[number];
-export const COURIER_NAMES = [
-  "ShopeeXpress",
-  "JNT Express",
-  "Lazada Express",
-  "Flash Express",
-  "TikTok Delivery",
-  "LBC",
-  "GOGO Xpress",
-  "Airship Express",
-] as const;
+export const COURIER_NAMES = ["Airship Express"] as const;
 export type CourierName = (typeof COURIER_NAMES)[number];
 export type ParcelStatus = "PICKED_UP" | "BOOKED" | "IN_TRANSIT" | "DELAYED" | "DELIVERED" | "CANCELLED";
 
@@ -69,8 +60,70 @@ export type Parcel = {
 
 export type BookingStatus = "PENDING" | "DRIVER_VEHICLE_ASSIGNED" | "DISPATCHED" | "CANCELLED";
 
+export type RoutePlanPoint = {
+  id?: string;
+  name?: string;
+  address?: string;
+  lat?: number | string | null;
+  lng?: number | string | null;
+  latitude?: number | string | null;
+  longitude?: number | string | null;
+  purpose?: string;
+  kind?: string;
+  arrival?: string;
+  departure?: string;
+  durationMinutes?: number;
+  instructions?: string;
+  parcelReference?: string;
+  parcelEvents?: Array<{ parcelId: string; trackingNumber: string; kind: "pickup" | "delivery" }>;
+};
+
+export type RoutePlanDetails = {
+  route_name?: string;
+  route_type?: string;
+  vehicle_type?: string;
+  priority?: string;
+  notes?: string;
+  estimated_load_kg?: number | null;
+  origin?: RoutePlanPoint;
+  destination?: RoutePlanPoint;
+  stops?: RoutePlanPoint[];
+  included_parcel_ids?: string[];
+  schedule?: {
+    depart_at?: string | null;
+    expected_arrival?: string | null;
+    window_start?: string | null;
+    window_end?: string | null;
+    duration_minutes?: number | null;
+  };
+};
+
 export type PersistedRoutePlan = {
   id?: string;
+  route_name?: string;
+  route_type?: string;
+  status?: string | null;
+  courier?: string | null;
+  pickup_location?: string;
+  pickupLocation?: string;
+  pickup_latitude?: number | null;
+  pickup_longitude?: number | null;
+  pickupLatitude?: number | null;
+  pickupLongitude?: number | null;
+  delivery_destinations?: RoutePlanPoint[];
+  deliveryDestinations?: RoutePlanPoint[];
+  route_details?: RoutePlanDetails | null;
+  routeDetails?: RoutePlanDetails | null;
+  planned_delivery_date?: string | null;
+  plannedDeliveryDate?: string | null;
+  optimized_distance_km?: number | null;
+  optimized_duration_min?: number | null;
+  optimizedDistanceKm?: number | null;
+  optimizedDurationMinutes?: number | null;
+  distance_km?: number | null;
+  estimated_duration_min?: number | null;
+  distanceKm?: number | null;
+  durationMinutes?: number | null;
   tripId?: string | null;
   bookingId?: string | null;
   vehicleId?: string | null;
@@ -83,15 +136,12 @@ export type PersistedRoutePlan = {
   stopSequence?: any;
   baselineDistanceKm?: number | null;
   baselineDurationMinutes?: number | null;
-  optimizedDistanceKm?: number | null;
-  optimizedDurationMinutes?: number | null;
   distanceSavedKm?: number | null;
   fuelEfficiencyKmPerL?: number | null;
   baselineFuelLiters?: number | null;
   optimizedFuelLiters?: number | null;
   fuelSavedLiters?: number | null;
   optimizationResult?: Record<string, any> | null;
-  status?: string | null;
 };
 
 export type DispatchState = {
@@ -106,7 +156,7 @@ export type Booking = {
   pickupLongitude?: number | null;
   dropoffLongitude?: any;
   dropoffLatitude?: any;
-  deliveryDestinations?: Array<{ name?: string; label?: string; lat?: number; lng?: number; latitude?: number; longitude?: number; status?: string }>;
+  deliveryDestinations?: RoutePlanPoint[];
   routePlanId?: string;
   routePlan?: PersistedRoutePlan | null;
   id: string;

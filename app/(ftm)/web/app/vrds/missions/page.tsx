@@ -1,1383 +1,916 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { useParcelStore } from "../../lib/parcelStore";
-import { getRoutePlan, getTrips } from "../../lib/api";
-import { HUB_POS } from "../../lib/parcelTypes";
+import {
+  Activity, AlertCircle, ArrowDownUp, ArrowRight, CalendarClock, Check, CheckCircle2,
+  Clock3, MapPin, Package, RefreshCw, Route, Search, Truck, UserRound, X,
+} from "lucide-react";
 import GlobalNavbar from "../../components/GlobalNavbar";
 import GlobalFooter from "../../components/GlobalFooter";
 import type { LeafletMarker } from "../../components/LeafletMap";
-
-// Average speed for ETA calculation (km/h)
-const AVERAGE_SPEED_KMH = 30;
+import type { PersistedRoutePlan, RoutePlanDetails, RoutePlanPoint } from "../../lib/parcelTypes";
+import { fetchJson } from "../../lib/api";
 
 const LeafletMap = dynamic(() => import("../../components/LeafletMap"), { ssr: false });
 
-const SERVICE_CITY_COORDINATES: Record<string, LatLng> = {
-  "Caloocan": { lat: 14.6579, lng: 120.9830 },
-  "Quezon City": { lat: 14.6760, lng: 121.0437 },
-  "Manila": { lat: 14.5995, lng: 120.9842 },
-  "Makati": { lat: 14.5547, lng: 121.0244 },
-  "Pasig": { lat: 14.5764, lng: 121.0851 },
-  "Mandaluyong": { lat: 14.5794, lng: 121.0359 },
-  "San Juan": { lat: 14.6019, lng: 121.0355 },
-  "Marikina": { lat: 14.6507, lng: 121.1029 },
-  "Pasay": { lat: 14.5378, lng: 120.9927 },
-  "Taguig": { lat: 14.5176, lng: 121.0509 },
-  "Parañaque": { lat: 14.4793, lng: 121.0198 },
-  "Valenzuela": { lat: 14.7000, lng: 120.9830 },
+type Point = { lat: number; lng: number };
+type LiveLegRoute = { tripId: string; start: Point; pickup: Point; points: Point[]; distanceKm: number; durationMin: number };
+type RawRecord = Record<string, unknown>;
+type DispatchTrip = RawRecord & {
+  id: string;
+  status?: string | null;
+  bookingId?: string | null;
+  booking_id?: string | null;
+  driverId?: string | null;
+  driver_id?: string | null;
+  driverName?: string | null;
+  driver_name?: string | null;
+  vehicleId?: string | null;
+  vehicle_id?: string | null;
+  vehiclePlate?: string | null;
+  vehicle_plate?: string | null;
+  routePlanId?: string | null;
+  route_plan_id?: string | null;
+  routePlan?: PersistedRoutePlan | null;
+  stops?: RoutePlanPoint[] | null;
+  routePlanStops?: RoutePlanPoint[] | null;
+  fromLocation?: string | null;
+  from_location?: string | null;
+  toLocation?: string | null;
+  to_location?: string | null;
+  fromCoords?: Point | null;
+  toCoords?: Point | null;
+  progress?: number | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  estimatedDeparture?: string | null;
+  estimatedArrival?: string | null;
+  pickupStatus?: string | null;
+  pickupProofUrl?: string | null;
+  pickupConfirmedAt?: string | null;
 };
+type DispatchBooking = RawRecord & {
+  id: string;
+  status?: string | null;
+  routePlanId?: string | null;
+  routePlan?: PersistedRoutePlan | null;
+  courier?: string | null;
+  courierId?: string | null;
+  driverId?: string | null;
+  driverName?: string | null;
+  vehicleId?: string | null;
+  vehiclePlate?: string | null;
+  deliveryDestinations?: RoutePlanPoint[];
+};
+type DispatchParcel = RawRecord & {
+  id: string;
+  bookingId?: string | null;
+  booking_id?: string | null;
+  routePlanId?: string | null;
+  route_plan_id?: string | null;
+  tripId?: string | null;
+  trip_id?: string | null;
+  trackingNumber?: string | null;
+  tracking_number?: string | null;
+  status?: string | null;
+  weightKg?: number | null;
+  weight_kg?: number | null;
+};
+type TrackedDriver = RawRecord & {
+  id: string;
+  full_name?: string | null;
+  last_location_lat?: number | string | null;
+  last_location_lng?: number | string | null;
+  last_location_at?: string | null;
+};
+type VehicleGpsRecord = RawRecord & {
+  latitude?: number | string | null;
+  longitude?: number | string | null;
+  lat?: number | string | null;
+  lng?: number | string | null;
+  recorded_at?: string | null;
+};
+type BoardFilter = "all" | "active" | "needs-assignment" | "in-progress" | "delayed" | "completed";
+type SortMode = "latest" | "oldest" | "scheduled";
 
-function resolveDestination(route: string, coordinates?: LatLng | null): LatLng {
-  if (coordinates && (coordinates.lat !== 0 || coordinates.lng !== 0)) return coordinates;
-  const city = Object.keys(SERVICE_CITY_COORDINATES).find((name) => route.toLowerCase().includes(name.toLowerCase()));
-  return city ? SERVICE_CITY_COORDINATES[city] : HUB_POS;
+function asRows<T>(value: unknown, label: string): T[] {
+  if (!Array.isArray(value)) throw new Error(`${label} response was not a list.`);
+  return value as T[];
 }
 
-function normalizeMissionCoordinate(value: any, fallback: LatLng = HUB_POS): LatLng {
-  const lat = Number(value?.lat ?? value?.latitude);
-  const lng = Number(value?.lng ?? value?.longitude);
-  return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : fallback;
+function field(record: RawRecord | null | undefined, ...keys: string[]): unknown {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (value !== null && value !== undefined && String(value).trim()) return value;
+  }
+  return null;
 }
 
-function normalizeRoutePlanPolyline(value: any): LatLng[] | null {
-  const routeData = value?.routeGeojson || value?.route_geojson || value?.route || value?.geometry || value;
-  const featureLine = Array.isArray(routeData?.features)
-    ? routeData.features.find((feature: any) => feature?.geometry?.type === "LineString")?.geometry?.coordinates
-    : null;
-  const routeGeometryCoordinates = Array.isArray(routeData?.route_geometry?.coordinates)
-    ? routeData.route_geometry.coordinates
-    : Array.isArray(routeData?.route_geometry)
-      ? routeData.route_geometry
-      : null;
-  const source =
-    routeData?.polyline ||
-    routeData?.coordinates ||
-    routeData?.geometry?.coordinates ||
-    featureLine ||
-    routeData?.route?.polyline ||
-    routeGeometryCoordinates ||
-    routeData?.polylineCoordinates ||
-    value?.polyline ||
-    value?.coordinates ||
-    value;
+function text(record: RawRecord | null | undefined, ...keys: string[]): string {
+  const value = field(record, ...keys);
+  return value == null ? "" : String(value).trim();
+}
 
+function numeric(record: RawRecord | null | undefined, ...keys: string[]): number | null {
+  const value = field(record, ...keys);
+  if (value == null) return null;
+  const result = Number(value);
+  return Number.isFinite(result) ? result : null;
+}
+
+function distanceBetween(start: Point, end: Point) {
+  const radians = Math.PI / 180;
+  const latitudeDelta = (end.lat - start.lat) * radians;
+  const longitudeDelta = (end.lng - start.lng) * radians;
+  const latitude1 = start.lat * radians;
+  const latitude2 = end.lat * radians;
+  const a = Math.sin(latitudeDelta / 2) ** 2
+    + Math.cos(latitude1) * Math.cos(latitude2) * Math.sin(longitudeDelta / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function distanceToPath(point: Point, path: Point[]) {
+  return path.length ? Math.min(...path.map((pathPoint) => distanceBetween(point, pathPoint))) : Number.POSITIVE_INFINITY;
+}
+
+function validPoint(point: Point | null): point is Point {
+  return Boolean(point && Math.abs(point.lat) <= 90 && Math.abs(point.lng) <= 180 && (point.lat !== 0 || point.lng !== 0));
+}
+
+function normalizedStatus(value: unknown) {
+  return String(value || "").trim().toLowerCase().replace(/[_-]+/g, " ");
+}
+
+function isCompleted(trip: DispatchTrip) {
+  return /completed|delivered|finished|arrived/.test(normalizedStatus(trip.status));
+}
+
+function isCancelled(trip: DispatchTrip) {
+  return /cancelled|canceled|failed|rejected/.test(normalizedStatus(trip.status));
+}
+
+function isDelayed(trip: DispatchTrip) {
+  if (/delayed|late|critical/.test(normalizedStatus(trip.status))) return true;
+  const arrival = trip.estimatedArrival || text(trip, "estimated_arrival", "eta_at");
+  return Boolean(arrival && !isCompleted(trip) && !isCancelled(trip) && new Date(arrival).getTime() < Date.now());
+}
+
+function isInProgress(trip: DispatchTrip) {
+  return /in transit|transit|delivering|en route|moving|dispatching|dispatched/.test(normalizedStatus(trip.status));
+}
+
+function needsAssignment(trip: DispatchTrip) {
+  return (!trip.driverId && !trip.driver_id) || (!trip.vehicleId && !trip.vehicle_id) || /pending assignment|unassigned/.test(normalizedStatus(trip.status));
+}
+
+function isActive(trip: DispatchTrip) {
+  return !isCompleted(trip) && !isCancelled(trip);
+}
+
+function routePlanFor(trip: DispatchTrip, booking?: DispatchBooking): PersistedRoutePlan | null {
+  return trip.routePlan || booking?.routePlan || null;
+}
+
+function routeDetailsFor(plan?: PersistedRoutePlan | null): RoutePlanDetails {
+  return plan?.routeDetails || plan?.route_details || {};
+}
+
+function planName(plan?: PersistedRoutePlan | null) {
+  const details = routeDetailsFor(plan);
+  return details.route_name || plan?.route_name || "Route plan not named";
+}
+
+function pointsFor(trip: DispatchTrip, booking?: DispatchBooking): RoutePlanPoint[] {
+  const plan = routePlanFor(trip, booking);
+  const planPoints = plan?.deliveryDestinations || plan?.delivery_destinations || booking?.deliveryDestinations || [];
+  const tripPoints = trip.stops || trip.routePlanStops || [];
+  return tripPoints.length ? tripPoints : planPoints;
+}
+
+function pointName(point?: RoutePlanPoint | null) {
+  return point?.name || point?.address || "Stop location not recorded";
+}
+
+function pointCoordinates(point?: RoutePlanPoint | null): Point | null {
+  const lat = Number(point?.lat ?? point?.latitude);
+  const lng = Number(point?.lng ?? point?.longitude);
+  return Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0) ? { lat, lng } : null;
+}
+
+function tripPointFrom(record: RawRecord, axis: "from" | "to"): Point | null {
+  const pair = record[axis === "from" ? "fromCoords" : "toCoords"];
+  if (pair && typeof pair === "object") {
+    const point = pair as RawRecord;
+    const lat = Number(point.lat);
+    const lng = Number(point.lng);
+    if (Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0)) return { lat, lng };
+  }
+  const lat = numeric(record, axis === "from" ? "from_latitude" : "to_latitude");
+  const lng = numeric(record, axis === "from" ? "from_longitude" : "to_longitude");
+  return lat != null && lng != null && (lat !== 0 || lng !== 0) ? { lat, lng } : null;
+}
+
+function savedRoutePolyline(plan?: PersistedRoutePlan | null): Point[] | null {
+  const raw = field(plan as RawRecord | null, "routeGeojson", "route_geojson");
+  if (!raw || typeof raw !== "object") return null;
+  const geo = raw as RawRecord;
+  const geometry = (geo.route_geometry || geo.routeGeometry || geo.geometry || geo) as RawRecord;
+  const features = Array.isArray(geo.features) ? geo.features : [];
+  const featureLine = features.find((feature) => {
+    const item = feature as RawRecord;
+    return field(item.geometry as RawRecord | undefined, "type") === "LineString";
+  }) as RawRecord | undefined;
+  const source = geometry.coordinates || geometry.polyline || (featureLine?.geometry as RawRecord | undefined)?.coordinates
+    || (Array.isArray(geo.routes) ? (geo.routes[0] as RawRecord | undefined)?.polyline : null);
   if (!Array.isArray(source)) return null;
-
-  const points = source.map((point: any) => {
-    if (Array.isArray(point)) {
-      if (point.length >= 2 && Number.isFinite(Number(point[0])) && Number.isFinite(Number(point[1]))) {
-        return { lat: Number(point[1]), lng: Number(point[0]) };
-      }
-      return null;
+  const points = source.map((item): Point | null => {
+    if (Array.isArray(item) && item.length >= 2) {
+      const lng = Number(item[0]);
+      const lat = Number(item[1]);
+      return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 ? { lat, lng } : null;
     }
-
-    if (!point || typeof point !== "object") return null;
-    return {
-      lat: Number(point?.lat ?? point?.latitude ?? point?.y ?? 0),
-      lng: Number(point?.lng ?? point?.longitude ?? point?.x ?? 0),
-    };
-  }).filter((point: LatLng | null): point is LatLng => point !== null && Number.isFinite(point.lat) && Number.isFinite(point.lng));
-
+    if (!item || typeof item !== "object") return null;
+    const point = item as RawRecord;
+    const lat = Number(point.lat ?? point.latitude);
+    const lng = Number(point.lng ?? point.longitude);
+    return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 ? { lat, lng } : null;
+  }).filter((point): point is Point => Boolean(point));
   return points.length > 1 ? points : null;
 }
 
-function calculatePolylineDistanceKm(points: LatLng[]): number {
-  let distanceKm = 0;
-  for (let index = 0; index < points.length - 1; index += 1) {
-    const first = points[index];
-    const second = points[index + 1];
-    const earthRadiusKm = 6371;
-    const latDelta = ((second.lat - first.lat) * Math.PI) / 180;
-    const lngDelta = ((second.lng - first.lng) * Math.PI) / 180;
-    const firstLat = (first.lat * Math.PI) / 180;
-    const secondLat = (second.lat * Math.PI) / 180;
-    const arc = Math.sin(latDelta / 2) ** 2
-      + Math.cos(firstLat) * Math.cos(secondLat) * Math.sin(lngDelta / 2) ** 2;
-    distanceKm += earthRadiusKm * 2 * Math.atan2(Math.sqrt(arc), Math.sqrt(1 - arc));
-  }
-  return distanceKm;
+function trackingWaypoints(trip: DispatchTrip, booking?: DispatchBooking): Point[] {
+  const plan = routePlanFor(trip, booking);
+  const stops = pointsFor(trip, booking);
+  const planPickup = plan ? {
+    lat: Number(plan.pickupLatitude ?? plan.pickup_latitude),
+    lng: Number(plan.pickupLongitude ?? plan.pickup_longitude),
+  } : null;
+  const origin = tripPointFrom(trip, "from")
+    || (planPickup && Number.isFinite(planPickup.lat) && Number.isFinite(planPickup.lng) && (planPickup.lat !== 0 || planPickup.lng !== 0) ? planPickup : null);
+  const destination = tripPointFrom(trip, "to") || pointCoordinates(routeDetailsFor(plan).destination) || pointCoordinates(stops[stops.length - 1]);
+  const points = [origin, ...stops.map(pointCoordinates), destination].filter((point): point is Point => Boolean(point));
+  return points.filter((point, index) => index === 0 || point.lat !== points[index - 1].lat || point.lng !== points[index - 1].lng);
 }
 
-/**
- * Fetches real road distance and duration from OSRM (Open Source Routing Machine).
- * Uses the /route endpoint to get actual driving metrics instead of straight-line distance.
- * Falls back gracefully if OSRM is unavailable.
- */
-async function fetchOsrmRouteMetrics(waypoints: LatLng[]): Promise<{ distanceKm: number; durationMin: number } | null> {
-  if (!Array.isArray(waypoints) || waypoints.length < 2) return null;
-  
-  try {
-    const response = await fetch("/api/route", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ waypoints }),
-      signal: AbortSignal.timeout(60000),
-    }).catch(() => null);
-    if (!response || !response.ok) return null;
-    
-    const data = await response.json();
-    if (!Array.isArray(data.polyline) || data.polyline.length < 2) return null;
-    return {
-      distanceKm: Number(data.distanceKm || 0),
-      durationMin: Number(data.durationMin || 0),
-    };
-  } catch (error) {
-    console.warn("[missions] OSRM route request failed:", error);
-    return null;
-  }
+function formatDate(value: unknown, includeTime = true) {
+  if (!value) return "Not scheduled";
+  const date = new Date(String(value));
+  if (!Number.isFinite(date.getTime())) return "Not scheduled";
+  return date.toLocaleString("en-PH", includeTime
+    ? { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" }
+    : { month: "short", day: "numeric", year: "numeric" });
+}
+
+function statusStyle(trip: DispatchTrip) {
+  if (isCancelled(trip)) return "border-slate-200 bg-slate-50 text-slate-600";
+  if (isCompleted(trip)) return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (isDelayed(trip)) return "border-rose-200 bg-rose-50 text-rose-700";
+  if (isInProgress(trip)) return "border-sky-200 bg-sky-50 text-sky-700";
+  if (needsAssignment(trip)) return "border-amber-200 bg-amber-50 text-amber-800";
+  return "border-pink-200 bg-pink-50 text-pink-700";
+}
+
+function statusLabel(trip: DispatchTrip) {
+  if (isCancelled(trip)) return "Cancelled";
+  if (isCompleted(trip)) return "Completed";
+  if (isDelayed(trip)) return "Delayed";
+  const value = String(trip.status || "Assigned").replace(/[_-]+/g, " ").trim();
+  return value.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function StatusBadge({ trip }: { trip: DispatchTrip }) {
+  const dot = isCompleted(trip) ? "bg-emerald-500" : isDelayed(trip) ? "bg-rose-500" : isInProgress(trip) ? "bg-sky-500" : needsAssignment(trip) ? "bg-amber-500" : "bg-pink-500";
+  return <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-bold ${statusStyle(trip)}`}><span className={`h-1.5 w-1.5 rounded-full ${dot}`} />{statusLabel(trip)}</span>;
+}
+
+function SummaryMetric({ label, value, detail, icon: Icon, tone }: { label: string; value: number; detail: string; icon: typeof Activity; tone: string }) {
+  return <article className="rounded-2xl border border-rose-100/80 bg-white p-4 shadow-[0_4px_16px_rgba(190,24,93,0.045)] transition hover:-translate-y-0.5 hover:shadow-[0_8px_22px_rgba(190,24,93,0.08)]">
+    <div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-[10px] font-bold uppercase tracking-[0.12em] text-slate-400">{label}</p><p className="mt-2 text-2xl font-extrabold leading-none text-slate-900 tabular-nums">{value}</p></div><span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${tone}`}><Icon className="h-4 w-4" /></span></div>
+    <p className="mt-2 text-[10px] text-slate-500">{detail}</p>
+  </article>;
+}
+
+function InfoCell({ label, value, icon: Icon }: { label: string; value: string; icon?: typeof Activity }) {
+  return <div className="min-w-0 rounded-xl border border-slate-100 bg-slate-50/75 p-3">
+    <p className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-[0.1em] text-slate-400">{Icon && <Icon className="h-3 w-3" />}{label}</p>
+    <p className="mt-1.5 break-words text-xs font-semibold leading-4 text-slate-800">{value || "Not recorded"}</p>
+  </div>;
 }
 
 export default function VrdsMissionsPage() {
-  const [activeSection, setActiveSection] = useState<"summary" | "list" | "map">("summary");
-  const [activeMarker, setActiveMarker] = useState<LeafletMarker | null>(null);
-  const [selectedDeliveryId, setSelectedDeliveryId] = useState<string | null>(null);
-  const [showRouteLines, setShowRouteLines] = useState(true);
-  const [timeUpdate, setTimeUpdate] = useState(0); // Incremented every minute to trigger ETA recalculation
-  const { bookings, parcels, drivers, vehicles } = useParcelStore();
-  const [trips, setTrips] = useState<any[]>([]);
-  const [routePlans, setRoutePlans] = useState<Record<string, any>>({});
-  const [roadPaths, setRoadPaths] = useState<Record<string, LatLng[]>>({});
-  const [osrmMetrics, setOsrmMetrics] = useState<Record<string, { distanceKm: number; durationMin: number }>>({});
-  const [osrmRouteErrors, setOsrmRouteErrors] = useState<Record<string, string>>({});
-  const [loadingRouteCount, setLoadingRouteCount] = useState(0);
+  const [trips, setTrips] = useState<DispatchTrip[]>([]);
+  const [bookings, setBookings] = useState<DispatchBooking[]>([]);
+  const [parcels, setParcels] = useState<DispatchParcel[]>([]);
+  const [trackedDrivers, setTrackedDrivers] = useState<TrackedDriver[]>([]);
+  const [vehicleGpsRecord, setVehicleGpsRecord] = useState<VehicleGpsRecord | null>(null);
+  const [vehicleGpsError, setVehicleGpsError] = useState("");
+  const [trackingUpdatedAt, setTrackingUpdatedAt] = useState<string | null>(null);
+  const [trackingError, setTrackingError] = useState("");
+  const [trackingConnection, setTrackingConnection] = useState<"connecting" | "live" | "reconnecting">("connecting");
+  const [liveLegRoute, setLiveLegRoute] = useState<LiveLegRoute | null>(null);
+  const [liveLegError, setLiveLegError] = useState("");
+  const [roadPaths, setRoadPaths] = useState<Record<string, { waypointKey: string; points: Point[] }>>({});
+  const [roadPathErrors, setRoadPathErrors] = useState<Record<string, { waypointKey: string; message: string }>>({});
+  const requestedRoadPaths = useRef(new Map<string, string>());
+  const requestedLiveLegRef = useRef<{ tripId: string; start: Point; requestedAt: number } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [pageError, setPageError] = useState("");
+  const [dataWarning, setDataWarning] = useState("");
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<BoardFilter>("active");
+  const [sortMode, setSortMode] = useState<SortMode>("latest");
+  const [selectedTripId, setSelectedTripId] = useState<string | null>(null);
+  const [focusedTripId, setFocusedTripId] = useState<string | null>(null);
+  const [mapFocusRequest, setMapFocusRequest] = useState(0);
+  const tripsRef = useRef<DispatchTrip[]>([]);
+  const pendingAcceptedTripIdRef = useRef<string | null>(null);
+  const suppressAutoFocusRef = useRef(false);
 
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setSelectedDeliveryId(null);
-        setActiveMarker(null);
+  const loadDispatchData = useCallback(async (quiet = false) => {
+    if (quiet) setRefreshing(true);
+    else setLoading(true);
+    setPageError("");
+    setDataWarning("");
+
+    const [tripResult, bookingResult, parcelResult, driverResult] = await Promise.allSettled([
+      fetchJson("/api/trips", { cache: "no-store" }),
+      fetchJson("/api/bookings", { cache: "no-store" }),
+      fetchJson("/api/parcels?history=true", { cache: "no-store" }),
+      fetchJson("/api/drivers", { cache: "no-store" }),
+    ]);
+
+    if (tripResult.status === "fulfilled") {
+      try {
+        const rows = asRows<DispatchTrip>(tripResult.value, "Dispatch");
+        tripsRef.current = rows;
+        setTrips(rows);
       }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
-
-  useEffect(() => {
-    getTrips().then(setTrips).catch(() => setTrips([]));
-  }, []);
-
-  useEffect(() => {
-    const ids = Array.from(
-      new Set([
-        ...trips.map((trip) => trip.routePlanId || trip.route_plan_id).filter(Boolean),
-        ...bookings.filter((booking) => booking.routePlanId).map((booking) => booking.routePlanId),
-        ...parcels.filter((parcel) => parcel.routePlanId).map((parcel) => parcel.routePlanId),
-      ])
-    ) as string[];
-
-    if (ids.length === 0) {
-      setRoutePlans({});
-      return;
+      catch (error) { setPageError(error instanceof Error ? error.message : "Dispatch data is invalid."); }
+    } else {
+      setPageError(tripResult.reason instanceof Error ? tripResult.reason.message : "Unable to load dispatch records.");
     }
 
-    let cancelled = false;
-    Promise.all(
-      ids.map(async (id) => {
-        try {
-          const plan = await getRoutePlan(id);
-          return [id, plan] as const;
-        } catch {
-          return null;
-        }
-      })
-    ).then((results) => {
-      if (cancelled) return;
-      const nextRoutePlans = Object.fromEntries(results.filter(Boolean) as [string, any][]);
-      setRoutePlans(nextRoutePlans);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [bookings, parcels, trips]);
-
-  const normalizeTripStatus = (value?: string | null) => {
-    const status = String(value || "").trim().toLowerCase();
-    if (!status) return "in-transit" as const;
-    if (/critical|rush|urgent|late|delayed/.test(status)) return "critical" as const;
-    if (/completed|delivered|finished/.test(status)) return "completed" as const;
-    if (/approach|near|arriving/.test(status)) return "approaching" as const;
-    return "in-transit" as const;
-  };
-
-  const calculateEtaAndProgress = (trip: any, booking?: any, osrmMetrics?: { distanceKm: number; durationMin: number } | null) => {
-    const now = new Date().getTime();
-    
-    // Priority 1: Use OSRM real road distance + average speed calculation
-    if (osrmMetrics && osrmMetrics.distanceKm > 0) {
-      const etaMinutes = osrmMetrics.durationMin || Math.ceil((osrmMetrics.distanceKm / AVERAGE_SPEED_KMH) * 60);
-      
-      // For progress calculation, prefer estimated times if available
-      const estimatedDeparture = trip?.estimatedDeparture || trip?.estimated_departure;
-      const estimatedArrival = trip?.estimatedArrival || trip?.estimated_arrival;
-      
-      if (estimatedDeparture && estimatedArrival) {
-        const departureTime = new Date(estimatedDeparture).getTime();
-        const arrivalTime = new Date(estimatedArrival).getTime();
-        
-        if (Number.isFinite(departureTime) && Number.isFinite(arrivalTime) && arrivalTime > departureTime) {
-          const totalDuration = (arrivalTime - departureTime) / 60000;
-          const elapsedTime = Math.max(0, (now - departureTime) / 60000);
-          const progress = Math.min(100, Math.max(0, (elapsedTime / totalDuration) * 100));
-          
-          return {
-            etaMinutes: Math.ceil(etaMinutes),
-            progress: Math.round(progress),
-            distanceKm: osrmMetrics.distanceKm,
-          };
-        }
-      }
-      
-      // Fallback: assume trip just started if no times available
-      return {
-        etaMinutes: Math.ceil(etaMinutes),
-        progress: Number(trip?.progress || 0),
-        distanceKm: osrmMetrics.distanceKm,
-      };
-    }
-    
-    // Priority 2: Use estimated departure/arrival times from database
-    const estimatedDeparture = trip?.estimatedDeparture || trip?.estimated_departure;
-    const estimatedArrival = trip?.estimatedArrival || trip?.estimated_arrival;
-
-    if (estimatedDeparture && estimatedArrival) {
-      const departureTime = new Date(estimatedDeparture).getTime();
-      const arrivalTime = new Date(estimatedArrival).getTime();
-
-      if (Number.isFinite(departureTime) && Number.isFinite(arrivalTime) && arrivalTime > departureTime) {
-        const totalDuration = (arrivalTime - departureTime) / 60000;
-        const elapsedTime = Math.max(0, (now - departureTime) / 60000);
-        const remainingTime = Math.max(0, totalDuration - elapsedTime);
-        const progress = Math.min(100, Math.max(0, (elapsedTime / totalDuration) * 100));
-
-        return {
-          etaMinutes: Math.ceil(remainingTime),
-          progress: Math.round(progress),
-        };
-      }
-    }
-
-    // Final fallback: use persisted duration, then derive an estimate from
-    // persisted distance. Never invent a fixed ETA for a generated route.
-    const durationMinutes = Number(
-      trip?.durationMinutes
-      ?? trip?.duration_minutes
-      ?? booking?.durationMinutes
-      ?? booking?.estimated_duration_min
-    );
-    const distanceKm = Number(
-      osrmMetrics?.distanceKm
-      ?? trip?.distanceKm
-      ?? trip?.distance_km
-      ?? booking?.distanceKm
-      ?? booking?.distance_km
-    );
-    const derivedDurationMinutes = Number.isFinite(distanceKm) && distanceKm > 0
-      ? Math.ceil((distanceKm / AVERAGE_SPEED_KMH) * 60)
-      : 0;
-    return {
-      etaMinutes: Number.isFinite(durationMinutes) && durationMinutes > 0 ? durationMinutes : derivedDurationMinutes,
-      progress: Number(trip?.progress || 0),
-    };
-  };
-
-  const resolveDriverName = (driverId?: string | null, fallbackName?: string | null) => {
-    if (fallbackName && String(fallbackName).trim()) return String(fallbackName).trim();
-    if (!driverId) return "Assigned driver";
-    const driver = drivers.find((item) => String(item.id) === String(driverId));
-    return driver?.name || `Driver ${String(driverId)}`;
-  };
-
-  const resolveDriverLocation = (driverId?: string | null) => {
-    if (!driverId) return null;
-    const driver = drivers.find((item) => String(item.id) === String(driverId)) as any;
-    const lat = Number(driver?.last_location_lat ?? driver?.latitude ?? driver?.location?.lat);
-    const lng = Number(driver?.last_location_lng ?? driver?.longitude ?? driver?.location?.lng);
-    return Number.isFinite(lat) && Number.isFinite(lng) && !(lat === 0 && lng === 0) ? { lat, lng } : null;
-  };
-
-  const resolveDriverPhone = (driverId?: string | null) => {
-    if (!driverId) return null;
-    const driver = drivers.find((item) => String(item.id) === String(driverId)) as any;
-    return driver?.phone || driver?.phoneNumber || null;
-  };
-
-  const DELIVERIES: Delivery[] = useMemo(() => {
-    const persistedDeliveries = trips.filter((trip) => {
-      const booking = bookings.find((item) => item.id === trip.bookingId || item.id === trip.booking_id);
-      const driverId = trip.driverId || trip.driver_id || booking?.driverId;
-      const vehicleId = trip.vehicleId || trip.vehicle_id || booking?.vehicleId;
-      const tripStatus = String(trip.status || trip.state || "").toLowerCase();
-      const hasMissionIdentity = Boolean(trip.bookingId || trip.booking_id || trip.id);
-      const isActive = !/completed|cancelled|failed|rejected/.test(tripStatus);
-      const hasAssignment = Boolean(driverId || vehicleId);
-      const hasRouteData = Boolean(
-        trip.fromLocation || trip.from || trip.toLocation || trip.to || trip.routePlanId || trip.route_plan_id || booking
-      );
-      return hasMissionIdentity && isActive && (hasAssignment || hasRouteData);
-    }).map((trip) => {
-      const booking = bookings.find((item) => item.id === trip.bookingId || item.id === trip.booking_id);
-      const bookingParcels = parcels.filter((p) => p.bookingId === trip.bookingId || p.bookingId === trip.booking_id);
-      const routePlanId = booking?.routePlanId || bookingParcels.find((parcel: any) => parcel.routePlanId)?.routePlanId || trip.routePlanId || trip.route_plan_id;
-      const routePlan = routePlanId ? routePlans[routePlanId] : null;
-        const routePlanPolyline = normalizeRoutePlanPolyline(routePlan);
-      const parcelCount = bookingParcels.length || booking?.parcelIds.length || booking?.parcelCount || 0;
-      const fromLocation = trip.fromLocation || trip.from || routePlan?.pickupLocation || booking?.routeLabel || "Airship Express Hub – Binondo, Manila";
-      const routeStops = Array.isArray(trip.stops)
-        ? trip.stops
-            .map((s: any) => ({
-              name: s.name || s.label || "Warehouse stop",
-              lat: Number(s.lat ?? s.latitude),
-              lng: Number(s.lng ?? s.longitude),
-              status: s.status,
-            }))
-            .filter((s: any) => Number.isFinite(s.lat) && Number.isFinite(s.lng))
-        : [];
-      const bookingStops = Array.isArray(booking?.deliveryDestinations)
-        ? booking.deliveryDestinations
-            .map((s: any) => ({
-              name: s.name || s.label || "Warehouse stop",
-              lat: Number(s.lat ?? s.latitude),
-              lng: Number(s.lng ?? s.longitude),
-              status: s.status,
-            }))
-            .filter((s: any) => Number.isFinite(s.lat) && Number.isFinite(s.lng))
-        : [];
-      const routePlanStops = Array.isArray(routePlan?.deliveryDestinations)
-        ? routePlan.deliveryDestinations
-            .map((s: any) => ({
-              name: s.name || s.label || "Warehouse stop",
-              lat: Number(s.lat ?? s.latitude),
-              lng: Number(s.lng ?? s.longitude),
-              status: s.status,
-            }))
-            .filter((s: any) => Number.isFinite(s.lat) && Number.isFinite(s.lng))
-        : routeStops.length > 0
-          ? routeStops
-          : bookingStops;
-      const destinationStop = routePlanStops[routePlanStops.length - 1];
-      const destinationName = destinationStop?.name || trip.toLocation || trip.to || booking?.routeLabel || "Assigned route";
-      const parcelDestination = bookingParcels.find((parcel: any) => {
-        const lat = Number(parcel.destLat);
-        const lng = Number(parcel.destLng);
-        return Number.isFinite(lat) && Number.isFinite(lng) && !(lat === 0 && lng === 0);
-      });
-      const destinationPosition = destinationStop
-        ? { lat: Number(destinationStop.lat), lng: Number(destinationStop.lng) }
-        : resolveDestination(
-          destinationName,
-          trip.toCoords
-            || (booking && booking.dropoffLatitude && booking.dropoffLongitude
-              ? { lat: Number(booking.dropoffLatitude), lng: Number(booking.dropoffLongitude) }
-              : null)
-            || (parcelDestination
-              ? { lat: Number(parcelDestination.destLat), lng: Number(parcelDestination.destLng) }
-              : null),
-        );
-      // A saved route plan is already ordered. Keep its final destination as
-      // the endpoint and pass only preceding destinations as OSRM waypoints.
-      const stops = routePlanStops.length > 1
-        ? routePlanStops.slice(0, -1)
-        : routePlanStops.length === 1
-          ? []
-          : bookingStops;
-      const stopCountLabel = stops.length > 1 ? ` • ${stops.length} stops` : "";
-      const startPoint = normalizeMissionCoordinate(
-        trip.fromCoords
-          || (booking?.pickupLatitude && booking?.pickupLongitude
-            ? { lat: booking.pickupLatitude, lng: booking.pickupLongitude }
-            : null)
-          || (routePlan?.pickupLocation
-            ? { lat: routePlan.pickupLatitude || 14.5995, lng: routePlan.pickupLongitude || 120.9745 }
-            : null)
-      );
-      const pickupStatus = String(trip.pickupStatus || trip.pickup_status || "pending").toLowerCase();
-      const pickupConfirmed = ["confirmed", "started", "complete", "completed"].includes(pickupStatus);
-      const deliveryDestinationName = destinationName;
-      const deliveryDestinationPosition = destinationPosition;
-      const activeDestinationName = pickupConfirmed ? deliveryDestinationName : "Airship Express Hub - Binondo, Manila";
-      const activeDestinationPosition = pickupConfirmed ? deliveryDestinationPosition : startPoint;
-
-      const savedRouteMetrics = routePlanPolyline
-        ? {
-            distanceKm: Number(routePlan?.distanceKm ?? routePlan?.distance_km ?? routePlan?.routeGeojson?.distance_km)
-              || calculatePolylineDistanceKm(routePlanPolyline),
-            durationMin: Number(routePlan?.durationMinutes ?? routePlan?.estimated_duration_min ?? routePlan?.routeGeojson?.estimated_duration_min) || 0,
-          }
-        : null;
-      const { etaMinutes, progress } = calculateEtaAndProgress(trip, booking, osrmMetrics[trip.id] || savedRouteMetrics);
-
-      // Extract courier info with smart fallback
-      // Priority: parcel courier > route plan courier > booking ID (for color diversity)
-      const courierFromParcels = bookingParcels.find((p) => p.courier)?.courier;
-      const courierFromRoutePlan = routePlan?.courier;
-      const courier = courierFromParcels || courierFromRoutePlan || `Route-${(trip.bookingId || trip.booking_id)?.substring(0, 6) || 'unknown'}`;
-      const driverName = resolveDriverName(trip.driverId || trip.driver_id, trip.driverName || booking?.driverName);
-      const driverLocation = resolveDriverLocation(trip.driverId || trip.driver_id || booking?.driverId);
-      const parcelDetails = bookingParcels.slice(0, 4).map((parcel) => {
-        const parcelAny = parcel as any;
-        const recipient = parcelAny.recipientName || parcelAny.recipient_name || "Recipient";
-        const type = parcelAny.parcelType || parcelAny.type || "Parcel";
-        const address = parcelAny.destinationAddress || parcelAny.address || parcelAny.dropoffAddress || "Address pending";
-        return `${recipient} • ${type} • ${address}`;
-      }).filter(Boolean);
-
-      return {
-        id: trip.id,
-        name: driverName,
-        driverName,
-        driverPhone: resolveDriverPhone(trip.driverId || trip.driver_id || booking?.driverId),
-        vehiclePlate: trip.vehiclePlate || trip.vehicle_plate || trip.vehicleId || trip.vehicle_id || "Assigned vehicle",
-        parcelSummary: `${parcelCount} parcels — ${activeDestinationName}${stopCountLabel}`,
-        parcelCount,
-        parcelDetails,
-        origin: fromLocation,
-        destination: activeDestinationName,
-        originPos: startPoint,
-        destPos: activeDestinationPosition,
-        currentPos: driverLocation || trip.fromCoords || startPoint,
-        progress,
-        etaMinutes,
-        status: normalizeTripStatus(trip.status),
-        bookingId: trip.bookingId || trip.booking_id,
-        courier,
-        stops,
-        routePlanPolyline: pickupConfirmed ? routePlanPolyline : null,
-      } as Delivery;
-    });
-
-    const localDeliveries = bookings
-      .filter((b) => {
-        const isActiveBooking = b.status === "DISPATCHED" || Boolean(b.driverId || b.vehicleId) || Boolean(b.routePlanId || b.routeLabel);
-        const notInTrips = !trips.some((trip) => trip.bookingId === b.id || trip.booking_id === b.id);
-        return isActiveBooking && notInTrips;
-      })
-      .map((b) => {
-        const bookingParcels = parcels.filter((p) => p.bookingId === b.id);
-        const routePlan = b.routePlanId ? routePlans[b.routePlanId] : null;
-        const routePlanPolyline = normalizeRoutePlanPolyline(routePlan);
-        
-        const savedRouteMetrics = routePlanPolyline
-          ? {
-              distanceKm: Number(routePlan?.distanceKm ?? routePlan?.distance_km ?? routePlan?.routeGeojson?.distance_km)
-                || calculatePolylineDistanceKm(routePlanPolyline),
-              durationMin: Number(routePlan?.durationMinutes ?? routePlan?.estimated_duration_min ?? routePlan?.routeGeojson?.estimated_duration_min) || 0,
-            }
-          : null;
-        const { etaMinutes, progress } = calculateEtaAndProgress(b, b, osrmMetrics[b.id] || savedRouteMetrics);
-        const isRush = etaMinutes > 0 && etaMinutes <= 15;
-
-        // Extract courier info with smart fallback
-        // Priority: parcel courier > route plan courier > booking ID (for color diversity)
-        const courierFromParcels = bookingParcels.find((p) => p.courier)?.courier;
-        const courierFromRoutePlan = routePlan?.courier;
-        const courier = courierFromParcels || courierFromRoutePlan || `Route-${b.id?.substring(0, 6) || 'unknown'}`;
-        const driverName = resolveDriverName(b.driverId, b.driverName);
-        const driverLocation = resolveDriverLocation(b.driverId);
-        const parcelDetails = bookingParcels.slice(0, 4).map((parcel) => {
-          const parcelAny = parcel as any;
-          const recipient = parcelAny.recipientName || parcelAny.recipient_name || "Recipient";
-          const type = parcelAny.parcelType || parcelAny.type || "Parcel";
-          const address = parcelAny.destinationAddress || parcelAny.address || parcelAny.dropoffAddress || "Address pending";
-          return `${recipient} • ${type} • ${address}`;
-        }).filter(Boolean);
-
-        const bookingStops = Array.isArray(b.deliveryDestinations)
-          ? b.deliveryDestinations
-              .map((s: any) => ({ name: s.name || s.label || "Warehouse stop", lat: Number(s.lat ?? s.latitude), lng: Number(s.lng ?? s.longitude), status: s.status }))
-              .filter((s: any) => Number.isFinite(s.lat) && Number.isFinite(s.lng))
-          : [];
-        const routePlanStops = Array.isArray(routePlan?.deliveryDestinations)
-          ? routePlan.deliveryDestinations
-              .map((s: any) => ({ name: s.name || s.label || "Warehouse stop", lat: Number(s.lat ?? s.latitude), lng: Number(s.lng ?? s.longitude), status: s.status }))
-              .filter((s: any) => Number.isFinite(s.lat) && Number.isFinite(s.lng))
-          : bookingStops;
-        const destinationStop = routePlanStops[routePlanStops.length - 1];
-        const destination = destinationStop?.name || b.routeLabel || "Assigned route";
-        const originPos = routePlan?.pickupLatitude && routePlan?.pickupLongitude
-          ? { lat: Number(routePlan.pickupLatitude), lng: Number(routePlan.pickupLongitude) }
-          : HUB_POS;
-        const currentPos = driverLocation || b.dispatch?.currentPos || originPos;
-
-        return {
-          id: b.id,
-          name: driverName,
-          driverName,
-          driverPhone: (b as any).driverPhone || resolveDriverPhone(b.driverId),
-          vehiclePlate: b.vehiclePlate || "Unassigned",
-          parcelSummary: `${bookingParcels.length || b.parcelIds.length} parcels — ${destination}${routePlanStops.length > 1 ? ` • ${routePlanStops.length} stops` : ""}`,
-          parcelCount: bookingParcels.length || b.parcelIds.length || 0,
-          parcelDetails,
-          origin: routePlan?.pickupLocation || "Airship Express Hub – Binondo, Manila",
-          destination,
-          originPos,
-          destPos: destinationStop ? { lat: Number(destinationStop.lat), lng: Number(destinationStop.lng) } : (bookingParcels[0] ? { lat: bookingParcels[0].destLat, lng: bookingParcels[0].destLng } : HUB_POS),
-          currentPos,
-          progress,
-          etaMinutes,
-          status: b.status === "DISPATCHED"
-            ? (isRush ? "critical" : b.dispatch?.status === "DELIVERING" ? "approaching" : "in-transit")
-            : "in-transit",
-          bookingId: b.id,
-          courier,
-          stops: routePlanStops,
-          routePlanPolyline: normalizeRoutePlanPolyline(routePlan),
-        } as Delivery;
-      });
-
-    const inTransitParcels = parcels.filter((parcel) => {
-      if (parcel.status !== "IN_TRANSIT" || !parcel.bookingId) return false;
-      const booking = bookings.find((item) => String(item.id) === String(parcel.bookingId));
-      return Boolean(booking?.driverId && booking?.vehicleId);
-    });
-    const inTransitGroups = new Map<string, typeof inTransitParcels>();
-    inTransitParcels.forEach((parcel) => {
-      const groupKey = parcel.bookingId || parcel.bulk_qr_code || parcel.id;
-      inTransitGroups.set(groupKey, [...(inTransitGroups.get(groupKey) || []), parcel]);
-    });
-
-    const parcelDeliveries = Array.from(inTransitGroups.entries()).map(([groupKey, groupParcels]) => {
-      const firstParcel = groupParcels[0];
-      const booking = bookings.find((item) => String(item.id) === String(firstParcel.bookingId || groupKey));
-      const assignedDriver = booking?.driverId ? drivers.find((driver) => String(driver.id) === String(booking.driverId)) : null;
-      const assignedVehicle = booking?.vehicleId ? vehicles.find((vehicle) => String(vehicle.id) === String(booking.vehicleId)) : null;
-      const destination = firstParcel.destinationAddress || "Destination pending";
-      const destinationPosition = firstParcel.destLat || firstParcel.destLng
-        ? { lat: Number(firstParcel.destLat), lng: Number(firstParcel.destLng) }
-        : resolveDestination(destination);
-      const driverLocation = resolveDriverLocation(booking?.driverId);
-      const { etaMinutes, progress } = calculateEtaAndProgress(firstParcel);
-      const parcelBookingId = firstParcel.bookingId || `in-transit-${groupKey}`;
-
-      return {
-        id: `parcel-${groupKey}`,
-        name: firstParcel.courier || "In-transit parcel",
-        driverName: booking?.driverName || assignedDriver?.name || "Unassigned driver",
-        driverPhone: (booking as any)?.driverPhone || resolveDriverPhone(booking?.driverId),
-        vehiclePlate: booking?.vehiclePlate || assignedVehicle?.plate || "Not assigned",
-        parcelSummary: `${groupParcels.length} parcel${groupParcels.length === 1 ? "" : "s"} — ${destination}`,
-        parcelCount: groupParcels.length,
-        parcelDetails: groupParcels.slice(0, 4).map((parcel) =>
-          `${parcel.trackingNumber} • ${parcel.destinationAddress || "Address pending"}`
-        ),
-        origin: "Airship Express Hub - Binondo, Manila",
-        destination,
-        originPos: HUB_POS,
-        destPos: destinationPosition,
-        currentPos: driverLocation || HUB_POS,
-        progress,
-        etaMinutes,
-        status: "in-transit",
-        bookingId: parcelBookingId,
-        courier: firstParcel.courier || "LBC",
-        stops: [],
-        routePlanPolyline: null,
-      } as Delivery;
-    });
-
-    // A trip is the canonical mission; an assigned booking is the fallback;
-    // in-transit parcels are only a final fallback. Deduplicate by booking so
-    // one delivery cannot produce multiple cards from those three sources.
-    const missionsByBooking = new Map<string, Delivery>();
-    for (const delivery of [...persistedDeliveries, ...localDeliveries, ...parcelDeliveries]) {
-      const missionKey = String(delivery.bookingId || delivery.id);
-      if (!missionsByBooking.has(missionKey)) missionsByBooking.set(missionKey, delivery);
-    }
-
-    // Keep dispatched missions visible before OSRM returns an ETA. Previously
-    // an ETA of zero filtered out every new mission, which also prevented the
-    // OSRM effect below from ever fetching its route and ETA.
-    const validDeliveries = Array.from(missionsByBooking.values()).filter((d) => {
-      if (d.status === "completed" || d.status === "cancelled") return false;
-      const booking = bookings.find((b) => String(b.id) === String(d.bookingId));
-      const trip = trips.find(
-        (t) => String(t.bookingId || t.booking_id) === String(d.bookingId)
-      );
-      return Boolean(booking || trip || d.bookingId);
-    });
-
-    // Show all valid active mission deliveries, newest first
-    if (validDeliveries.length > 0) {
-      return [...validDeliveries].sort((a, b) => {
-        const tripA = trips.find((t) => t.bookingId === a.bookingId || t.booking_id === a.bookingId);
-        const tripB = trips.find((t) => t.bookingId === b.bookingId || t.booking_id === b.bookingId);
-
-        const timeA = tripA?.createdAt || tripA?.created_at || 0;
-        const timeB = tripB?.createdAt || tripB?.created_at || 0;
-
-        const dateA = new Date(timeA).getTime();
-        const dateB = new Date(timeB).getTime();
-        return dateB - dateA;
-      });
-    }
-
-    return validDeliveries;
-  }, [bookings, parcels, routePlans, trips, drivers, timeUpdate, osrmMetrics]);
-
-  const routeRequestKey = useMemo(
-    () => DELIVERIES.map((delivery) => {
-      const stops = (delivery.stops || []).map((stop) => `${stop.lat},${stop.lng}`).join(";");
-      return `${delivery.id}:${delivery.originPos.lat},${delivery.originPos.lng}:${delivery.destPos.lat},${delivery.destPos.lng}:${stops}`;
-    }).join("|"),
-    [DELIVERIES]
-  );
-
-  // Update ETA and progress every minute as time passes
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setTimeUpdate((prev: number) => prev + 1); // Trigger recalculation of memoized DELIVERIES
-    }, 60000); // Update every 60 seconds
-    return () => clearInterval(interval);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    const getWaypoints = (delivery: Delivery) => [
-      normalizeMissionCoordinate(delivery.originPos),
-      ...(delivery.stops || []).map((stop) => normalizeMissionCoordinate(stop)),
-      normalizeMissionCoordinate(delivery.destPos),
-    ].filter((point, index, points) => {
-      if (point.lat === 0 && point.lng === 0) return false;
-      if (index === 0) return true;
-      const previous = points[index - 1];
-      return point.lat !== previous.lat || point.lng !== previous.lng;
-    });
-    const savedPaths = Object.fromEntries(
-      DELIVERIES
-        .filter((delivery) => delivery.routePlanPolyline)
-        .map((delivery) => [delivery.id, delivery.routePlanPolyline])
-    ) as Record<string, LatLng[]>;
-    setRoadPaths(savedPaths);
-
-    const routesToFetch = DELIVERIES.filter((delivery) => {
-      if (delivery.routePlanPolyline) return false;
-      const waypoints = getWaypoints(delivery);
-      return waypoints.length >= 2 && waypoints.every((point) =>
-        Number.isFinite(point.lat) && Number.isFinite(point.lng)
-        && point.lat >= -90 && point.lat <= 90
-        && point.lng >= -180 && point.lng <= 180
-      );
-    });
-    setLoadingRouteCount(routesToFetch.length);
-
-    if (routesToFetch.length === 0) {
-      setLoadingRouteCount(0);
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    // Fetch one complete OSRM response per delivery and publish each result
-    // immediately, rather than waiting for the slowest route in the batch.
-    DELIVERIES.forEach((delivery) => {
-      if (delivery.routePlanPolyline) return;
-      const waypoints = getWaypoints(delivery);
-
-      if (waypoints.length < 2 || !waypoints.every((point) => Number.isFinite(point.lat) && Number.isFinite(point.lng))) {
-        setOsrmRouteErrors((current) => ({ ...current, [delivery.id]: "Invalid route coordinates" }));
+    const warnings: string[] = [];
+    const setOptionalRows = <T,>(result: PromiseSettledResult<unknown>, label: string, setter: (rows: T[]) => void) => {
+      if (result.status === "rejected") {
+        warnings.push(result.reason instanceof Error ? result.reason.message : `Unable to load ${label}.`);
+        setter([]);
         return;
       }
+      try { setter(asRows<T>(result.value, label)); }
+      catch (error) { warnings.push(error instanceof Error ? error.message : `Unable to load ${label}.`); setter([]); }
+    };
+    setOptionalRows<DispatchBooking>(bookingResult, "booking", setBookings);
+    setOptionalRows<DispatchParcel>(parcelResult, "parcel", setParcels);
+    if (driverResult.status === "fulfilled") {
+      try {
+        setTrackedDrivers(asRows<TrackedDriver>(driverResult.value, "Driver location"));
+        setTrackingError("");
+        setTrackingUpdatedAt(new Date().toISOString());
+      } catch (error) {
+        setTrackingError(error instanceof Error ? error.message : "Driver locations are unavailable.");
+      }
+    } else {
+      setTrackedDrivers([]);
+      setTrackingError(driverResult.reason instanceof Error ? driverResult.reason.message : "Driver locations are unavailable.");
+    }
+    setDataWarning(warnings.join(" "));
+    setUpdatedAt(new Date().toISOString());
+    setLoading(false);
+    setRefreshing(false);
+  }, []);
 
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 60000);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void loadDispatchData(), 0);
+    return () => window.clearTimeout(timer);
+  }, [loadDispatchData]);
 
-      fetch("/api/route", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ waypoints }),
-        signal: controller.signal,
-        cache: "no-store",
-      })
-        .then((response) => response.ok ? response.json() : null)
-        .then((result) => {
+  const refreshDriverLocations = useCallback(async () => {
+    try {
+      const rows = asRows<TrackedDriver>(await fetchJson("/api/drivers", { cache: "no-store" }), "Driver location");
+      setTrackedDrivers(rows);
+      setTrackingUpdatedAt(new Date().toISOString());
+      setTrackingError("");
+    } catch (error) {
+      setTrackingError(error instanceof Error ? error.message : "Driver locations are unavailable.");
+    }
+  }, []);
+
+  const refreshVehicleGps = useCallback(async () => {
+    const trip = tripsRef.current.find((item) => item.id === focusedTripId);
+    const vehicleId = String(trip?.vehicleId || trip?.vehicle_id || "");
+    if (!vehicleId) {
+      setVehicleGpsRecord(null);
+      setVehicleGpsError("");
+      return;
+    }
+    try {
+      const rows = asRows<VehicleGpsRecord>(await fetchJson(`/api/tracking/vehicle-gps/${encodeURIComponent(vehicleId)}?limit=1`, { cache: "no-store" }), "Vehicle GPS");
+      if (String(tripsRef.current.find((item) => item.id === focusedTripId)?.vehicleId || tripsRef.current.find((item) => item.id === focusedTripId)?.vehicle_id || "") !== vehicleId) return;
+      setVehicleGpsRecord(rows[rows.length - 1] || null);
+      setVehicleGpsError("");
+    } catch (error) {
+      setVehicleGpsRecord(null);
+      setVehicleGpsError(error instanceof Error ? error.message : "Vehicle GPS is unavailable.");
+    }
+  }, [focusedTripId]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void refreshDriverLocations();
+      void refreshVehicleGps();
+    }, 30_000);
+    return () => window.clearInterval(interval);
+  }, [refreshDriverLocations, refreshVehicleGps]);
+
+  useEffect(() => {
+    void refreshVehicleGps();
+  }, [refreshVehicleGps]);
+
+  useEffect(() => {
+    const source = new EventSource("/api/events/assignments");
+    let refreshTimer = 0;
+    source.onopen = () => setTrackingConnection("live");
+    source.onerror = () => setTrackingConnection("reconnecting");
+    source.addEventListener("tracking_error", () => setTrackingConnection("reconnecting"));
+    source.addEventListener("assignment", () => void loadDispatchData(true));
+    source.addEventListener("accepted", (event) => {
+      try {
+        const tripId = String((JSON.parse((event as MessageEvent).data) as { trip_id?: string }).trip_id || "");
+        if (!tripId) return;
+        if (!tripsRef.current.some((trip) => trip.id === tripId)) {
+          pendingAcceptedTripIdRef.current = tripId;
+          return;
+        }
+        suppressAutoFocusRef.current = false;
+        setFocusedTripId(tripId);
+        setFilter("active");
+      } catch {
+        setTrackingConnection("reconnecting");
+      }
+    });
+    source.addEventListener("tracking", () => {
+      if (refreshTimer) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = 0;
+        void refreshDriverLocations();
+        void refreshVehicleGps();
+      }, 500);
+    });
+    return () => {
+      source.close();
+      if (refreshTimer) window.clearTimeout(refreshTimer);
+    };
+  }, [loadDispatchData, refreshDriverLocations, refreshVehicleGps]);
+
+  useEffect(() => {
+    if (!selectedTripId) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSelectedTripId(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [selectedTripId]);
+
+  const bookingsById = useMemo(() => new Map(bookings.map((booking) => [booking.id, booking])), [bookings]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const pending = trips.filter(isActive).flatMap((trip) => {
+      const booking = bookingsById.get(String(trip.bookingId || trip.booking_id || ""));
+      const plan = routePlanFor(trip, booking || undefined);
+      if (savedRoutePolyline(plan)) return [];
+      const waypoints = trackingWaypoints(trip, booking || undefined);
+      if (waypoints.length < 2) return [];
+      const waypointKey = waypoints.map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`).join(";");
+      if (requestedRoadPaths.current.get(trip.id) === waypointKey) return [];
+      requestedRoadPaths.current.set(trip.id, waypointKey);
+      return [{ tripId: trip.id, waypointKey, waypoints }];
+    });
+
+    pending.forEach(({ tripId, waypointKey, waypoints }) => {
+      void (async () => {
+        try {
+          const result = await fetchJson("/api/route", {
+            method: "POST",
+            cache: "no-store",
+            body: JSON.stringify({ waypoints }),
+          }) as { polyline?: unknown };
+          const points = Array.isArray(result?.polyline)
+            ? result.polyline.map((point) => pointCoordinates(point as RoutePlanPoint)).filter((point): point is Point => Boolean(point))
+            : [];
+          if (points.length < 2) throw new Error("OSRM did not return a usable road path.");
           if (cancelled) return;
-          if (!Array.isArray(result?.polyline) || result.polyline.length < 2) {
-            setOsrmRouteErrors((current) => ({ ...current, [delivery.id]: result?.error || "OSRM returned no route" }));
-            return;
-          }
-          setRoadPaths((current) => ({
-            ...current,
-            [delivery.id]: result.polyline,
-          }));
-          setOsrmMetrics((current) => ({
-            ...current,
-            [delivery.id]: {
-              distanceKm: Number(result.distanceKm || 0),
-              durationMin: Number(result.durationMin || 0),
-            },
-          }));
-          setOsrmRouteErrors((current) => {
-            if (!current[delivery.id]) return current;
+          setRoadPaths((current) => ({ ...current, [tripId]: { waypointKey, points } }));
+          setRoadPathErrors((current) => {
             const next = { ...current };
-            delete next[delivery.id];
+            delete next[tripId];
             return next;
           });
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setOsrmRouteErrors((current) => ({ ...current, [delivery.id]: "OSRM route unavailable" }));
-          }
-        })
-        .finally(() => {
-          window.clearTimeout(timeout);
-          if (!cancelled) setLoadingRouteCount((count) => Math.max(0, count - 1));
-        });
+        } catch (error) {
+          if (cancelled) return;
+          setRoadPathErrors((current) => ({
+            ...current,
+            [tripId]: { waypointKey, message: error instanceof Error ? error.message : "Road routing is unavailable." },
+          }));
+        } finally {
+          if (cancelled && requestedRoadPaths.current.get(tripId) === waypointKey) requestedRoadPaths.current.delete(tripId);
+        }
+      })();
     });
 
-    return () => {
-      cancelled = true;
-      setLoadingRouteCount(0);
-    };
-  }, [routeRequestKey]);
+    return () => { cancelled = true; };
+  }, [bookingsById, trips]);
 
-  const critical = DELIVERIES.find((m) => m.status === "critical");
-  const others = DELIVERIES.filter((m) => m.id !== critical?.id);
+  const selectedTrip = selectedTripId ? trips.find((trip) => trip.id === selectedTripId) || null : null;
+  const selectedBooking = selectedTrip ? bookingsById.get(String(selectedTrip.bookingId || selectedTrip.booking_id || "")) || null : null;
+  const selectedPlan = selectedTrip ? routePlanFor(selectedTrip, selectedBooking || undefined) : null;
+  const selectedPlanDetails = routeDetailsFor(selectedPlan);
+  const selectedStops = selectedTrip ? pointsFor(selectedTrip, selectedBooking || undefined) : [];
+  const selectedTripParcels = selectedTrip ? parcels.filter((parcel) => {
+    const bookingId = String(selectedTrip.bookingId || selectedTrip.booking_id || "");
+    const routePlanId = String(selectedTrip.routePlanId || selectedTrip.route_plan_id || "");
+    return String(parcel.tripId || parcel.trip_id || "") === selectedTrip.id
+      || Boolean(bookingId && String(parcel.bookingId || parcel.booking_id || "") === bookingId)
+      || Boolean(routePlanId && String(parcel.routePlanId || parcel.route_plan_id || "") === routePlanId);
+  }) : [];
 
-  // Courier colors for visual distinction on map
-  const courierColors = useMemo(() => {
-    const colors = new Map<string, string>();
-    const colorPalette = [
-      "#3b82f6", // Blue
-      "#ef4444", // Red
-      "#f59e0b", // Amber
-      "#10b981", // Emerald
-      "#8b5cf6", // Violet
-      "#ec4899", // Pink
-      "#06b6d4", // Cyan
-      "#84cc16", // Lime
-    ];
-    const uniqueCouriers = Array.from(new Set(DELIVERIES.map((d) => d.courier || "LBC")));
-    uniqueCouriers.forEach((courier, idx) => {
-      colors.set(courier, colorPalette[idx % colorPalette.length]);
+  const activeTrips = trips.filter(isActive);
+  const pendingAssignmentCount = activeTrips.filter(needsAssignment).length;
+  const inProgressCount = trips.filter(isInProgress).length;
+  const completedCount = trips.filter(isCompleted).length;
+  const delayedCount = activeTrips.filter(isDelayed).length;
+  const trackingTimestamp = trackingUpdatedAt ? new Date(trackingUpdatedAt).getTime() : 0;
+
+  const displayedTrips = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const rows = trips.filter((trip) => {
+      const booking = bookingsById.get(String(trip.bookingId || trip.booking_id || ""));
+      const plan = routePlanFor(trip, booking || undefined);
+      const related = parcels.filter((parcel) => {
+        const bookingId = String(trip.bookingId || trip.booking_id || "");
+        const routePlanId = String(trip.routePlanId || trip.route_plan_id || "");
+        return String(parcel.tripId || parcel.trip_id || "") === trip.id
+          || Boolean(bookingId && String(parcel.bookingId || parcel.booking_id || "") === bookingId)
+          || Boolean(routePlanId && String(parcel.routePlanId || parcel.route_plan_id || "") === routePlanId);
+      });
+      const statusMatch = filter === "all"
+        || (filter === "active" && isActive(trip))
+        || (filter === "needs-assignment" && needsAssignment(trip))
+        || (filter === "in-progress" && isInProgress(trip))
+        || (filter === "delayed" && isDelayed(trip))
+        || (filter === "completed" && isCompleted(trip));
+      if (!statusMatch) return false;
+      if (!query) return true;
+      const stops = pointsFor(trip, booking || undefined).map(pointName).join(" ");
+      const parcelTerms = related.map((parcel) => `${text(parcel, "trackingNumber", "tracking_number")} ${text(parcel, "recipientName", "recipient_name")} ${text(parcel, "destinationAddress", "delivery_address", "destination")}`).join(" ");
+      const terms = [trip.id, trip.bookingId, trip.booking_id, trip.driverName, trip.driver_name, trip.vehiclePlate, trip.vehicle_plate, planName(plan), field(trip, "fromLocation", "from_location"), field(trip, "toLocation", "to_location"), stops, parcelTerms].filter(Boolean).join(" ").toLowerCase();
+      return terms.includes(query);
     });
-    return colors;
-  }, [DELIVERIES]);
-
-  const markers: LeafletMarker[] = [
-    {
-      id: "airship-hub",
-      position: HUB_POS,
-      color: "#db2777",
-      radius: 10,
-      isHub: true,
-      label: (
-        <div className="space-y-1 text-sm leading-tight">
-          <div className="font-semibold text-pink-950">Airship Express</div>
-          <div className="text-[13px] text-pink-700/80">Courier service · 352 Escolta St</div>
-          <div className="inline-flex items-center gap-2 text-[12px] font-semibold text-pink-600">
-            <span className="inline-flex items-center gap-1 text-amber-400">★ ★ ★ ★ ★</span>
-            Open · Closes 5 PM
-          </div>
-        </div>
-      ),
-      meta: {
-        title: "Airship Express",
-        subtitle: "Courier service · 352 Escolta St",
-        details: <div className="text-sm text-pink-800/80">Open · Closes 5 PM</div>,
-      },
-    },
-    ...DELIVERIES.flatMap((m) => {
-      const routePath = roadPaths[m.id] || m.routePlanPolyline;
-      const routeIndex = routePath && routePath.length > 1
-        ? Math.min(routePath.length - 1, Math.max(0, Math.round((m.progress / 100) * (routePath.length - 1))))
-        : -1;
-      const vehiclePosition = routeIndex >= 0 ? routePath[routeIndex] : m.currentPos;
-      const deliveryMarkers: LeafletMarker[] = [
-        {
-          id: m.id,
-          position: vehiclePosition,
-          color: m.status === "critical" ? "#e11d48" : "#be185d",
-          isVehicle: true,
-          label: (
-            <div className="space-y-1 text-sm leading-tight">
-              <div className="font-semibold text-slate-900">{m.name}</div>
-              <div className="text-slate-600">Driver: {m.driverName}</div>
-              <div className="text-slate-600">Vehicle: {m.vehiclePlate}</div>
-              <div className="text-slate-600">ETA: {formatEta(m.etaMinutes)}</div>
-              <div className="text-slate-600">{m.parcelSummary}</div>
-            </div>
-          ),
-          radius: m.status === "critical" ? 10 : 7,
-          meta: {
-            title: m.driverName || "Mission",
-            subtitle: `${m.courier || "Courier"} • ${m.vehiclePlate}`,
-            details: (
-              <div className="space-y-1 text-slate-600">
-                <div><span className="font-semibold text-slate-800">Courier:</span> {m.courier || "Unassigned"}</div>
-                <div><span className="font-semibold text-slate-800">Driver:</span> {m.driverName}</div>
-                <div><span className="font-semibold text-slate-800">Parcel count:</span> {m.parcelCount}</div>
-                <div className="pt-1 border-t border-slate-200 mt-1">
-                  <div className="font-semibold text-slate-800">Parcel details</div>
-                  {m.parcelDetails.length > 0 ? (
-                    <div className="space-y-1">
-                      {m.parcelDetails.map((detail, idx) => (
-                        <div key={idx} className="break-words text-[11px] leading-relaxed text-slate-700">
-                          {detail}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="text-[11px] text-slate-500">No parcel details available.</div>
-                  )}
-                </div>
-              </div>
-            ),
-          },
-        },
-      ];
-
-      // Add stop markers for each stop in the route
-      if (m.stops && m.stops.length > 0) {
-        m.stops.forEach((stop, index) => {
-          deliveryMarkers.push({
-            id: `${m.id}-stop-${index}`,
-            position: { lat: stop.lat, lng: stop.lng },
-            color: "#8b5cf6",
-            label: `Stop ${index + 1}: ${stop.name}`,
-            radius: 5,
-            meta: {
-              title: `Stop ${index + 1}`,
-              subtitle: stop.name,
-              details: <div className="text-sm text-slate-600">Delivery stop</div>,
-            },
-          });
-        });
+    return rows.sort((first, second) => {
+      if (sortMode === "scheduled") {
+        const firstTime = new Date(String(first.estimatedDeparture || first.estimated_departure || first.createdAt || first.created_at || "")).getTime();
+        const secondTime = new Date(String(second.estimatedDeparture || second.estimated_departure || second.createdAt || second.created_at || "")).getTime();
+        return (Number.isFinite(firstTime) ? firstTime : Number.MAX_SAFE_INTEGER) - (Number.isFinite(secondTime) ? secondTime : Number.MAX_SAFE_INTEGER);
       }
+      const firstTime = new Date(String(first.updatedAt || first.updated_at || first.createdAt || first.created_at || "")).getTime();
+      const secondTime = new Date(String(second.updatedAt || second.updated_at || second.createdAt || second.created_at || "")).getTime();
+      const order = (Number.isFinite(firstTime) ? firstTime : 0) - (Number.isFinite(secondTime) ? secondTime : 0);
+      return sortMode === "latest" ? -order : order;
+    });
+  }, [bookingsById, filter, parcels, search, sortMode, trips]);
 
-      // Add destination marker
-      deliveryMarkers.push({
-        id: `${m.id}-dest`,
-        position: m.destPos,
-        color: "#f43f5e",
-        label: (
-          <div className="space-y-1 text-sm leading-tight">
-            <div className="font-semibold text-slate-900">Destination</div>
-            <div className="text-slate-600">{m.destination}</div>
-            <div className="text-slate-600">Route end point</div>
-          </div>
-        ),
-        radius: 6,
-        meta: {
-          title: "Destination",
-          subtitle: m.destination,
-          details: <div className="text-sm text-slate-600">Route end point</div>,
-        },
+  const liveTracking = (() => {
+    const markers: LeafletMarker[] = [];
+    const coloredPaths: Array<{ points: Point[]; color: string; label: string }> = [];
+    const markerTripIds = new Map<string, string>();
+    const focusPointsByTrip: Record<string, Point[]> = {};
+    const gpsDriverIds = new Set<string>();
+    const locations: Array<{ driverName: string; tripId: string; recordedAt: string | null; isFresh: boolean }> = [];
+    let routesPending = 0;
+    let routesUnavailable = 0;
+    const routeColors = ["#db2777", "#2563eb", "#0f766e", "#b45309", "#7c3aed"];
+
+    trips.filter(isActive).forEach((trip, tripIndex) => {
+      const booking = bookingsById.get(String(trip.bookingId || trip.booking_id || ""));
+      const plan = routePlanFor(trip, booking || undefined);
+      const routePoints = trackingWaypoints(trip, booking || undefined);
+      const waypointKey = routePoints.map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`).join(";");
+      const storedPath = savedRoutePolyline(plan);
+      const requestedPath = roadPaths[trip.id];
+      const roadPath = storedPath || (requestedPath?.waypointKey === waypointKey ? requestedPath.points : null);
+      const routeError = roadPathErrors[trip.id];
+      const routeColor = routeColors[tripIndex % routeColors.length];
+      const trackingId = `dispatch-${trip.id}`;
+      focusPointsByTrip[trip.id] = roadPath && roadPath.length > 1 ? roadPath : routePoints;
+
+      if (roadPath && roadPath.length > 1) coloredPaths.push({ points: roadPath, color: routeColor, label: planName(plan) });
+      else if (routePoints.length > 1) {
+        if (routeError?.waypointKey === waypointKey) routesUnavailable += 1;
+        else routesPending += 1;
+      }
+      routePoints.forEach((position, index) => {
+        const markerId = `${trackingId}-route-${index}`;
+        const label = index === 0 ? "P" : index === routePoints.length - 1 ? "D" : String(index);
+        markers.push({ id: markerId, position, color: routeColor, label, meta: { title: planName(plan), subtitle: `${trip.id} · ${label === "P" ? "Pickup" : label === "D" ? "Delivery" : `Stop ${label}`}` } });
+        markerTripIds.set(markerId, trip.id);
       });
 
-      return deliveryMarkers;
-    }),
+      const driverId = String(trip.driverId || trip.driver_id || "");
+      if (!driverId || gpsDriverIds.has(driverId)) return;
+      const driver = trackedDrivers.find((item) => item.id === driverId);
+      if (!driver) return;
+      const lat = Number(driver.last_location_lat);
+      const lng = Number(driver.last_location_lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) return;
+
+      gpsDriverIds.add(driverId);
+      const recordedAt = driver.last_location_at ? new Date(driver.last_location_at).getTime() : NaN;
+      const isFresh = trackingTimestamp > 0 && Number.isFinite(recordedAt) && trackingTimestamp - recordedAt <= 5 * 60_000 && recordedAt <= trackingTimestamp;
+      const markerId = `dispatch-${trip.id}-gps`;
+      const driverName = text(driver, "full_name", "name") || text(trip, "driverName", "driver_name") || "Assigned driver";
+      markers.push({
+        id: markerId,
+        position: { lat, lng },
+        color: isFresh ? "#059669" : "#64748b",
+        label: "GPS",
+        isVehicle: true,
+        meta: { title: driverName, subtitle: `${isFresh ? "Live GPS" : "Last known position"}${driver.last_location_at ? ` · ${formatDate(driver.last_location_at)}` : ""}` },
+      });
+      markerTripIds.set(markerId, trip.id);
+      locations.push({ driverName, tripId: trip.id, recordedAt: driver.last_location_at || null, isFresh });
+    });
+
+    return { markers, coloredPaths, markerTripIds, focusPointsByTrip, gpsDriverCount: gpsDriverIds.size, locations, routesPending, routesUnavailable };
+  })();
+
+  const focusedTrip = focusedTripId ? trips.find((trip) => trip.id === focusedTripId) || null : null;
+  const focusedBooking = focusedTrip ? bookingsById.get(String(focusedTrip.bookingId || focusedTrip.booking_id || "")) || null : null;
+  const focusedPlan = focusedTrip ? routePlanFor(focusedTrip, focusedBooking || undefined) : null;
+  const focusedTripStarted = Boolean(focusedTrip && (normalizedStatus(focusedTrip.status) === "in transit"
+    || normalizedStatus(field(focusedTrip, "pickupStatus", "pickup_status")) === "started"));
+  const focusedRouteWaypoints = focusedTrip ? trackingWaypoints(focusedTrip, focusedBooking || undefined) : [];
+  const focusedWaypointKey = focusedRouteWaypoints.map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`).join(";");
+  const focusedSavedRoute = savedRoutePolyline(focusedPlan);
+  const focusedRequestedRoute = focusedTrip ? roadPaths[focusedTrip.id] : null;
+  const focusedRoutePlanPath = focusedSavedRoute
+    || (focusedRequestedRoute?.waypointKey === focusedWaypointKey ? focusedRequestedRoute.points : []);
+  const focusedDriverId = String(focusedTrip?.driverId || focusedTrip?.driver_id || "");
+  const focusedDriver = trackedDrivers.find((driver) => driver.id === focusedDriverId) || null;
+  const focusedVehicleGpsPosition = useMemo(() => {
+    if (!vehicleGpsRecord) return null;
+    const position = {
+      lat: Number(vehicleGpsRecord.latitude ?? vehicleGpsRecord.lat),
+      lng: Number(vehicleGpsRecord.longitude ?? vehicleGpsRecord.lng),
+    };
+    return validPoint(position) ? position : null;
+  }, [vehicleGpsRecord]);
+  const focusedDriverGpsPosition = useMemo(() => {
+    if (!focusedDriver) return null;
+    const position = { lat: Number(focusedDriver.last_location_lat), lng: Number(focusedDriver.last_location_lng) };
+    return validPoint(position) ? position : null;
+  }, [focusedDriver]);
+  const focusedGpsPosition = focusedVehicleGpsPosition || focusedDriverGpsPosition;
+  const focusedPickupPosition = useMemo(() => {
+    if (!focusedTrip) return null;
+    const pickup = trackingWaypoints(focusedTrip, focusedBooking || undefined)[0] || null;
+    return validPoint(pickup) ? pickup : null;
+  }, [focusedTrip, focusedBooking]);
+  const focusedGpsAtValue = focusedVehicleGpsPosition ? vehicleGpsRecord?.recorded_at : focusedDriver?.last_location_at;
+  const focusedGpsAt = focusedGpsAtValue ? new Date(focusedGpsAtValue) : null;
+  const focusedGpsFresh = Boolean(focusedGpsAt && Date.now() - focusedGpsAt.getTime() <= 5 * 60_000);
+  const focusedTripParcels = focusedTrip ? parcels.filter((parcel) => {
+    const bookingId = String(focusedTrip.bookingId || focusedTrip.booking_id || "");
+    const routePlanId = String(focusedTrip.routePlanId || focusedTrip.route_plan_id || "");
+    return String(parcel.tripId || parcel.trip_id || "") === focusedTrip.id
+      || Boolean(bookingId && String(parcel.bookingId || parcel.booking_id || "") === bookingId)
+      || Boolean(routePlanId && String(parcel.routePlanId || parcel.route_plan_id || "") === routePlanId);
+  }) : [];
+
+  useEffect(() => {
+    const pendingTripId = pendingAcceptedTripIdRef.current;
+    if (pendingTripId && trips.some((trip) => trip.id === pendingTripId)) {
+      pendingAcceptedTripIdRef.current = null;
+      suppressAutoFocusRef.current = false;
+      setFocusedTripId(pendingTripId);
+      setFilter("active");
+      return;
+    }
+    if (focusedTripId || suppressAutoFocusRef.current) return;
+    const acceptedMission = trips
+      .filter((trip) => /scheduled|accepted/.test(normalizedStatus(trip.status)) && !needsAssignment(trip))
+      .sort((first, second) => new Date(String(second.updatedAt || second.updated_at || "")).getTime()
+        - new Date(String(first.updatedAt || first.updated_at || "")).getTime())[0];
+    if (!acceptedMission) return;
+    setFocusedTripId(acceptedMission.id);
+    setFilter("active");
+  }, [trips, focusedTripId]);
+
+  useEffect(() => {
+    if (!focusedTrip || focusedTripStarted || !focusedGpsPosition || !focusedPickupPosition) return;
+    const existingRouteMatches = liveLegRoute?.tripId === focusedTrip.id
+      && liveLegRoute.pickup.lat === focusedPickupPosition.lat
+      && liveLegRoute.pickup.lng === focusedPickupPosition.lng;
+    const isOnExistingRoute = existingRouteMatches && distanceToPath(focusedGpsPosition, liveLegRoute.points) <= 0.4;
+    if (isOnExistingRoute && distanceBetween(focusedGpsPosition, liveLegRoute.start) <= 0.5) return;
+
+    const previousRequest = requestedLiveLegRef.current;
+    if (previousRequest?.tripId === focusedTrip.id
+      && Date.now() - previousRequest.requestedAt < 15_000
+      && distanceBetween(focusedGpsPosition, previousRequest.start) < 0.5) return;
+
+    const start = focusedGpsPosition;
+    const tripId = focusedTrip.id;
+    requestedLiveLegRef.current = { tripId, start, requestedAt: Date.now() };
+    setLiveLegError("");
+    void (async () => {
+      try {
+        const result = await fetchJson("/api/route", {
+          method: "POST",
+          cache: "no-store",
+          body: JSON.stringify({ waypoints: [start, focusedPickupPosition] }),
+        }) as { polyline?: unknown; distanceKm?: number; durationMin?: number };
+        const points = Array.isArray(result.polyline)
+          ? result.polyline.map((point) => pointCoordinates(point as RoutePlanPoint)).filter((point): point is Point => Boolean(point))
+          : [];
+        if (points.length < 2) throw new Error("No road route was returned.");
+        if (requestedLiveLegRef.current?.tripId !== tripId) return;
+        setLiveLegRoute({
+          tripId,
+          start,
+          pickup: focusedPickupPosition,
+          points,
+          distanceKm: Number(result.distanceKm) || distanceBetween(start, focusedPickupPosition),
+          durationMin: Number(result.durationMin) || 0,
+        });
+      } catch (error) {
+        if (requestedLiveLegRef.current?.tripId !== tripId) return;
+        setLiveLegError(error instanceof Error ? error.message : "Driving directions are unavailable.");
+      }
+    })();
+  }, [focusedGpsPosition, focusedPickupPosition, focusedTrip, focusedTripStarted, liveLegRoute]);
+
+  const focusedRouteMatches = Boolean(focusedTrip && liveLegRoute?.tripId === focusedTrip.id
+    && focusedPickupPosition
+    && liveLegRoute.pickup.lat === focusedPickupPosition.lat
+    && liveLegRoute.pickup.lng === focusedPickupPosition.lng);
+  const focusedRouteIsCurrent = Boolean(focusedRouteMatches && focusedGpsPosition
+    && distanceToPath(focusedGpsPosition, liveLegRoute!.points) <= 0.4);
+  const focusedPickupLegPath = focusedGpsPosition && focusedPickupPosition
+    ? focusedRouteIsCurrent ? liveLegRoute!.points : [focusedGpsPosition, focusedPickupPosition]
+    : [];
+  const focusedMapPath = focusedTripStarted ? focusedRoutePlanPath : focusedPickupLegPath;
+  const focusedMapMarkers: LeafletMarker[] = [
+    ...(focusedGpsPosition ? [{
+      id: `mission-${focusedTripId}-vehicle`,
+      position: focusedGpsPosition,
+      color: focusedGpsFresh ? "#059669" : "#64748b",
+      label: "Vehicle",
+      isVehicle: true,
+      meta: { title: text(focusedTrip, "vehiclePlate", "vehicle_plate") || "Assigned vehicle", subtitle: `${focusedGpsFresh ? "Live" : "Last known"} ${focusedVehicleGpsPosition ? "vehicle GPS" : "driver GPS fallback"}` },
+    }] : []),
+    ...(focusedTripStarted
+      ? focusedRouteWaypoints.map((position, index): LeafletMarker => ({
+        id: `mission-${focusedTripId}-route-${index}`,
+        position,
+        color: index === 0 ? "#db2777" : "#2563eb",
+        label: index === 0 ? "Pickup" : index === focusedRouteWaypoints.length - 1 ? "Delivery" : String(index),
+        meta: { title: index === 0 ? "Pickup origin" : index === focusedRouteWaypoints.length - 1 ? "Delivery destination" : `Route stop ${index}`, subtitle: pointName(focusedTrip?.stops?.[index - 1]) },
+      }))
+      : focusedPickupPosition ? [{
+        id: `mission-${focusedTripId}-pickup`,
+        position: focusedPickupPosition,
+        color: "#db2777",
+        label: "Pickup",
+        meta: { title: "Parcel pickup", subtitle: text(focusedTrip, "fromLocation", "from_location") || text(focusedBooking, "pickup_location", "pickupLocation") || "Pickup origin" },
+      }] : []),
   ];
-
-  const coloredPaths = useMemo(() => {
-    return DELIVERIES
-      .map((m) => {
-        // If a delivery is selected, only show its path
-        if (selectedDeliveryId && m.id !== selectedDeliveryId) {
-          return null;
-        }
-
-        const color = courierColors.get(m.courier || "LBC") || "#3b82f6";
-        const roadPath = roadPaths[m.id] || m.routePlanPolyline;
-        
-        if (roadPath && roadPath.length > 1) {
-          return {
-            points: roadPath,
-            color,
-            label: m.courier || "LBC",
-          };
-        }
-
-        // Do not draw a straight-line approximation. It looks like a valid
-        // road route and is misleading while OSRM is still loading or fails.
-        return null;
-      })
-      .filter(Boolean) as Array<{ points: LatLng[]; color: string; label: string }>;
-  }, [DELIVERIES, roadPaths, selectedDeliveryId, courierColors]);
-
-  // Get selected delivery details for coordinate display
-  const selectedDelivery = selectedDeliveryId 
-    ? DELIVERIES.find((d) => d.id === selectedDeliveryId)
-    : null;
-  const selectedOsrmError = selectedDeliveryId
-    ? osrmRouteErrors[selectedDeliveryId]
-    : null;
+  const focusedMapFocusPoints = focusedTripStarted
+    ? [...focusedMapPath, ...(focusedGpsPosition ? [focusedGpsPosition] : [])]
+    : focusedMapPath;
+  const focusedRouteDistanceExact = Boolean(focusedRouteIsCurrent && liveLegRoute && focusedGpsPosition
+    && distanceBetween(focusedGpsPosition, liveLegRoute.start) <= 0.15);
+  const focusedPlanDistance = numeric(focusedPlan as RawRecord | null, "optimizedDistanceKm", "optimized_distance_km", "distanceKm", "distance_km");
+  const focusedRouteDistance = focusedTripStarted
+    ? focusedPlanDistance ?? numeric(focusedTrip, "distanceKm", "distance_km")
+    : focusedRouteDistanceExact && liveLegRoute
+      ? liveLegRoute.distanceKm
+      : focusedGpsPosition && focusedPickupPosition ? distanceBetween(focusedGpsPosition, focusedPickupPosition) : null;
+  const focusedEta = focusedTripStarted
+    ? formatDate(focusedTrip?.estimatedArrival || field(focusedTrip, "estimated_arrival", "eta_at") || routeDetailsFor(focusedPlan).schedule?.expected_arrival || focusedPlan?.plannedDeliveryDate || focusedPlan?.planned_delivery_date)
+    : focusedRouteDistanceExact && liveLegRoute?.durationMin
+      ? new Date(Date.now() + liveLegRoute.durationMin * 60_000).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" })
+      : focusedTrip?.estimatedArrival || field(focusedTrip, "estimated_arrival", "eta_at")
+        ? formatDate(focusedTrip?.estimatedArrival || field(focusedTrip, "estimated_arrival", "eta_at"))
+        : "Unavailable";
 
   return (
-    <div className="min-h-screen flex flex-col bg-transparent text-inherit">
+    <div className="min-h-screen bg-[#faf8fa] text-slate-800 antialiased">
       <GlobalNavbar />
+      <main className="mx-auto w-full max-w-[1800px] space-y-5 px-4 py-5 sm:px-6 lg:px-8">
+        <header className="flex flex-col gap-4 rounded-2xl border border-rose-100 bg-white p-5 shadow-[0_6px_22px_rgba(190,24,93,0.045)] sm:flex-row sm:items-center sm:justify-between sm:p-6">
+          <div className="min-w-0"><div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.15em] text-rose-600"><Activity className="h-3.5 w-3.5" /> VRDS · Operations</div><h1 className="mt-1.5 text-xl font-extrabold text-slate-900 sm:text-2xl">Active Dispatch</h1><p className="mt-1 text-xs text-slate-500">Live trip assignments, pickup proof, route schedules, and delivery status.</p></div>
+          <div className="flex shrink-0 flex-wrap gap-2"><button type="button" onClick={() => void loadDispatchData(true)} disabled={refreshing} className="inline-flex items-center gap-2 rounded-xl border border-rose-100 bg-white px-3.5 py-2.5 text-xs font-bold text-slate-600 transition hover:border-rose-200 hover:bg-rose-50 disabled:opacity-60"><RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} /> Refresh</button></div>
+        </header>
 
-      <main className="flex-1 w-full px-4 py-8 md:px-8 lg:px-12">
-        <div className="mx-auto max-w-container py-6 space-y-12">
-          {/* Header & Controls */}
-          <section className="space-y-6">
-            <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-              <div>
-                <p className="text-xs font-bold uppercase tracking-[0.28em] text-pink-600">VRDS Mission Control</p>
-                <h1 className="mt-2 text-3xl font-extrabold tracking-tight text-slate-900 md:text-4xl">Active deliveries</h1>
-                <p className="mt-2 max-w-2xl text-slate-600">
-                  Monitor current dispatches, reroute urgent deliveries, and keep the fleet moving on time.
-                </p>
+        <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5" aria-label="Dispatch summary">
+          <SummaryMetric label="Active dispatches" value={activeTrips.length} detail="Not yet completed" icon={Truck} tone="bg-rose-50 text-rose-600" />
+          <SummaryMetric label="Pending assignment" value={pendingAssignmentCount} detail="Trips without assigned resources" icon={UserRound} tone="bg-amber-50 text-amber-700" />
+          <SummaryMetric label="In progress" value={inProgressCount} detail="Pickup confirmed or en route" icon={Activity} tone="bg-sky-50 text-sky-700" />
+          <SummaryMetric label="Completed" value={completedCount} detail="Delivered dispatches" icon={CheckCircle2} tone="bg-emerald-50 text-emerald-700" />
+          <SummaryMetric label="Delayed" value={delayedCount} detail="Past due or flagged late" icon={AlertCircle} tone="bg-rose-50 text-rose-700" />
+        </section>
+
+        <div className="grid items-stretch gap-4 xl:grid-cols-[minmax(300px,340px)_minmax(0,1fr)] xl:gap-5">
+        <section className="order-1 flex min-w-0 flex-col overflow-hidden rounded-2xl border border-rose-100 bg-white shadow-[0_5px_20px_rgba(190,24,93,0.045)] xl:sticky xl:top-4 xl:col-start-2 xl:row-start-1 xl:self-stretch xl:min-h-[480px]">
+          <header className="flex flex-wrap items-center justify-between gap-3 border-b border-rose-100 px-4 py-3.5 sm:px-5">
+            <div><div className="flex items-center gap-2"><span className={`h-2 w-2 rounded-full ${trackingConnection === "live" ? "bg-emerald-500" : "bg-amber-500"}`} /><h2 className="text-sm font-bold text-slate-900">{focusedTrip ? `Mission ${focusedTrip.id}` : "Live tracking"}</h2></div><p className="mt-1 text-[10px] text-slate-500">{focusedTripStarted ? "Pickup complete · following the started delivery route plan" : focusedTrip ? "Vehicle location and driving route to parcel pickup" : "Driver GPS fixes and recorded dispatch routes · live updates with polling fallback"}</p></div>
+            <div className="flex flex-wrap items-center gap-2 text-[10px] font-semibold"><span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 ${trackingConnection === "live" ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-800"}`}><span className={`h-1.5 w-1.5 rounded-full ${trackingConnection === "live" ? "bg-emerald-500" : "bg-amber-500"}`} />{trackingConnection === "live" ? "Realtime connected" : "Reconnecting · polling active"}</span>{!focusedTrip && <><span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-600">Road routes {liveTracking.coloredPaths.length}</span>{liveTracking.routesPending > 0 && <span className="rounded-full bg-sky-50 px-2.5 py-1 text-sky-700">Routing {liveTracking.routesPending}</span>}</>}{trackingUpdatedAt && <span className="text-slate-400">Updated {formatDate(trackingUpdatedAt)}</span>}</div>
+          </header>
+          {focusedTrip && <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 bg-rose-50/40 px-4 py-3 sm:px-5">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 text-[10px] text-slate-600">
+              <StatusBadge trip={focusedTrip} />
+              <span className="inline-flex items-center gap-1.5"><UserRound className="h-3 w-3 text-rose-500" />{text(focusedDriver, "full_name", "name") || text(focusedTrip, "driverName", "driver_name") || "Driver not assigned"}</span>
+              <span className="inline-flex items-center gap-1.5"><Truck className="h-3 w-3 text-rose-500" />{text(focusedTrip, "vehiclePlate", "vehicle_plate") || "Vehicle not assigned"}</span>
+              <span className="inline-flex items-center gap-1.5"><Package className="h-3 w-3 text-rose-500" />{focusedTripParcels.length} parcel{focusedTripParcels.length === 1 ? "" : "s"}{focusedTripParcels[0] ? ` · ${text(focusedTripParcels[0], "trackingNumber", "tracking_number") || focusedTripParcels[0].id} · ${text(focusedTripParcels[0], "recipientName", "recipient_name") || "Recipient not recorded"}` : ""}</span>
+              <span className="inline-flex items-center gap-1.5"><MapPin className="h-3 w-3 text-rose-500" />{text(focusedTrip, "fromLocation", "from_location") || text(focusedBooking, "pickup_location", "pickupLocation") || "Pickup location not recorded"}</span>
+              <span className="inline-flex items-center gap-1.5"><Route className="h-3 w-3 text-rose-500" />{focusedRouteDistance == null ? "Distance unavailable" : `${focusedTripStarted ? "" : focusedRouteDistanceExact ? "" : "Approx. "}${focusedRouteDistance.toFixed(1)} km ${focusedTripStarted ? "planned" : "to pickup"}`}</span>
+              <span className="inline-flex items-center gap-1.5"><Clock3 className="h-3 w-3 text-rose-500" />{focusedTripStarted ? "Delivery ETA" : "Pickup ETA"} {focusedEta}</span>
+            </div>
+            <button type="button" onClick={() => { suppressAutoFocusRef.current = true; setFocusedTripId(null); }} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-3 py-2 text-[10px] font-bold text-rose-700 transition hover:bg-rose-50"><X className="h-3 w-3" />All missions</button>
+          </div>}
+          <div className="flex min-h-0 flex-1 p-3 sm:p-4">
+            <div className="relative h-[320px] min-h-0 w-full min-w-0 overflow-hidden rounded-xl border border-rose-100 bg-slate-50 sm:h-[390px] xl:h-full xl:min-h-[400px]">
+              {(focusedTrip ? focusedMapMarkers.length > 0 : liveTracking.markers.length > 0) ? <LeafletMap center={focusedTrip ? focusedGpsPosition || focusedPickupPosition || liveTracking.markers[0]?.position : liveTracking.markers[0].position} zoom={focusedTrip ? 13 : 10} markers={focusedTrip ? focusedMapMarkers : liveTracking.markers} coloredPaths={focusedTrip ? (focusedMapPath.length > 1 ? [{ points: focusedMapPath, color: "#db2777", label: focusedTripStarted ? "Started route plan" : "Vehicle to pickup" }] : []) : liveTracking.coloredPaths} focusKey={focusedTrip ? `${focusedTrip.id}:${focusedTripStarted}:${focusedMapPath.length}:${mapFocusRequest}` : focusedTripId ? `${focusedTripId}:${liveTracking.focusPointsByTrip[focusedTripId]?.length || 0}` : null} focusPoints={focusedTrip ? focusedMapFocusPoints : focusedTripId ? liveTracking.focusPointsByTrip[focusedTripId] || [] : []} routeColor="#db2777" className="h-full min-h-0 w-full rounded-xl" onMarkerClick={(marker) => { const tripId = liveTracking.markerTripIds.get(marker.id); if (tripId) { setFocusedTripId(tripId); setSelectedTripId(tripId); } }} /> : <div className="flex h-full flex-col items-center justify-center px-6 text-center"><MapPin className="h-8 w-8 text-rose-300" /><p className="mt-3 text-xs font-bold text-slate-700">{loading ? "Loading mission locations" : focusedTrip ? "Mission coordinates unavailable" : "No location coordinates available"}</p><p className="mt-1 max-w-sm text-[10px] leading-4 text-slate-500">{loading ? "Loading trips and current driver locations..." : focusedTrip ? "Waiting for vehicle GPS and pickup coordinates from the linked trip records." : "The map will show driver GPS fixes and trip routes when valid coordinates are reported by the tracking service."}</p></div>}
+              {!focusedTrip && trackingError && <p role="status" className="absolute bottom-2 left-2 right-2 rounded-lg border border-amber-200 bg-white/95 px-3 py-2 text-[10px] text-amber-800 shadow-sm">Live driver locations unavailable: {trackingError}</p>}
+              {focusedTrip && (!focusedGpsPosition || !focusedPickupPosition) && <p role="status" className="absolute bottom-2 left-2 right-2 rounded-lg border border-amber-200 bg-white/95 px-3 py-2 text-[10px] text-amber-800 shadow-sm">{!focusedGpsPosition ? vehicleGpsError || trackingError || "Waiting for valid vehicle GPS coordinates." : "Pickup coordinates are missing from the linked trip, route plan, and booking."}</p>}
+              {focusedTrip && !focusedTripStarted && focusedGpsPosition && focusedPickupPosition && (liveLegError || !focusedRouteIsCurrent) && <p role="status" className="absolute bottom-2 left-2 right-2 rounded-lg border border-sky-200 bg-white/95 px-3 py-2 text-[10px] text-sky-800 shadow-sm">{liveLegError ? "Road routing unavailable; showing the direct direction to pickup." : "Updating driving route from the latest vehicle position…"}</p>}
+              {focusedTripStarted && focusedMapPath.length < 2 && <p role="status" className="absolute bottom-2 left-2 right-2 rounded-lg border border-sky-200 bg-white/95 px-3 py-2 text-[10px] text-sky-800 shadow-sm">Loading the saved or optimized route plan geometry…</p>}
+              {!trackingError && (liveTracking.routesUnavailable > 0 || liveTracking.routesPending > 0) && <p role="status" className={`absolute bottom-2 left-2 right-2 rounded-lg border bg-white/95 px-3 py-2 text-[10px] shadow-sm ${liveTracking.routesUnavailable > 0 ? "border-amber-200 text-amber-800" : "border-sky-200 text-sky-800"}`}>{liveTracking.routesUnavailable > 0 ? `Road geometry unavailable for ${liveTracking.routesUnavailable} route${liveTracking.routesUnavailable === 1 ? "" : "s"}; no straight-line substitute is shown.` : `Calculating ${liveTracking.routesPending} road route${liveTracking.routesPending === 1 ? "" : "s"} with OSRM…`}{liveTracking.routesUnavailable > 0 && liveTracking.routesPending > 0 ? ` ${liveTracking.routesPending} more route${liveTracking.routesPending === 1 ? " is" : "s are"} still routing.` : ""}</p>}
+            </div>
+          </div>
+        </section>
+
+        {pageError && <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-800"><span>{pageError}</span><button type="button" onClick={() => void loadDispatchData()} className="font-bold underline">Retry</button></div>}
+        {dataWarning && <div role="status" className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">Some related records could not be loaded: {dataWarning}</div>}
+        <section className="order-2 min-w-0 space-y-3 rounded-2xl border border-rose-100 bg-white p-3 shadow-[0_5px_20px_rgba(190,24,93,0.045)] xl:order-none xl:col-start-1 xl:row-start-1 xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto hide-scrollbar">
+            <div className="flex min-w-0 flex-col gap-2 rounded-2xl border border-rose-100 bg-white p-3 shadow-[0_4px_16px_rgba(190,24,93,0.035)]">
+              <label className="relative block min-w-0 w-full"><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search dispatch, route, driver, vehicle, parcel…" className="block w-full min-w-0 rounded-xl border border-slate-200 bg-slate-50/70 py-2.5 pl-9 pr-3 text-xs outline-none transition focus:border-rose-300 focus:bg-white focus:ring-2 focus:ring-rose-100" aria-label="Search dispatches" /></label>
+              <div className="grid min-w-0 grid-cols-2 gap-2">
+                <select value={filter} onChange={(event) => setFilter(event.target.value as BoardFilter)} aria-label="Filter dispatch status" className="block w-full min-w-0 rounded-xl border border-slate-200 bg-white px-2.5 py-2.5 text-[11px] font-semibold text-slate-700 outline-none focus:border-rose-300 focus:ring-2 focus:ring-rose-100"><option value="active">Active dispatches</option><option value="all">All statuses</option><option value="needs-assignment">Needs assignment</option><option value="in-progress">In progress</option><option value="delayed">Delayed</option><option value="completed">Completed</option></select>
+                <select value={sortMode} onChange={(event) => setSortMode(event.target.value as SortMode)} aria-label="Sort dispatches" className="block w-full min-w-0 rounded-xl border border-slate-200 bg-white px-2.5 py-2.5 text-[11px] font-semibold text-slate-700 outline-none focus:border-rose-300 focus:ring-2 focus:ring-rose-100"><option value="latest">Latest activity</option><option value="oldest">Oldest activity</option><option value="scheduled">Departure time</option></select>
               </div>
-
-              <nav className="inline-flex w-full max-w-md items-center gap-1 rounded-2xl border border-pink-100 bg-white/70 p-1.5 shadow-[inset_1px_1px_0_rgba(255,255,255,0.9),0_8px_20px_rgba(190,24,93,0.06)]" aria-label="Mission sections">
-                {([
-                  ["summary", "Summary", "dashboard"],
-                  ["list", "Delivery list", "format_list_bulleted"],
-                  ["map", "Live map", "map"],
-                ] as const).map(([section, label, icon]) => (
-                  <button
-                    key={section}
-                    type="button"
-                    onClick={() => setActiveSection(section)}
-                    aria-current={activeSection === section ? "page" : undefined}
-                    className={`inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-black transition ${
-                      activeSection === section
-                        ? "bg-pink-600 text-white shadow-[0_5px_12px_rgba(190,24,93,0.24)]"
-                        : "text-slate-500 hover:bg-pink-50 hover:text-pink-700"
-                    }`}
-                  >
-                    <span className="material-symbols-outlined text-[16px]">{icon}</span>
-                    <span>{label}</span>
-                  </button>
-                ))}
-              </nav>
             </div>
 
-            {/* Flat Stats Grid */}
-            <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-4 pt-4">
-              <StatItem icon="local_shipping" label="Active deliveries" value={`${DELIVERIES.length}`} sub={`${critical ? 1 : 0} rush`} />
-              <StatItem icon="schedule" label="Average ETA" value={DELIVERIES.length ? `${Math.round(DELIVERIES.reduce((sum, m) => sum + m.etaMinutes, 0) / DELIVERIES.length)}m` : "—"} />
-              <StatItem icon="warning" label="Critical missions" value={`${critical ? 1 : 0}`} sub="Needs attention" />
-              <StatItem icon="map" label="Vehicles tracked" value={`${DELIVERIES.length}`} sub="Live location points" />
-            </div>
+            <div className="flex items-center justify-between px-1"><div><h2 className="text-sm font-bold text-slate-900">Dispatch board</h2><p className="mt-0.5 text-[10px] text-slate-500">{displayedTrips.length} records {updatedAt ? `· Updated ${formatDate(updatedAt)}` : ""}</p></div><ArrowDownUp className="h-4 w-4 text-rose-400" /></div>
+
+            {loading ? <div className="grid gap-3 md:grid-cols-2"><div className="h-52 animate-pulse rounded-2xl border border-rose-100 bg-white" /><div className="h-52 animate-pulse rounded-2xl border border-rose-100 bg-white" /></div>
+              : displayedTrips.length === 0 ? <div className="flex min-h-64 flex-col items-center justify-center rounded-2xl border border-dashed border-rose-200 bg-white px-6 text-center"><span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-rose-50 text-rose-500"><Route className="h-5 w-5" /></span><p className="mt-3 text-sm font-bold text-slate-800">{trips.length ? "No dispatches match these filters" : "No dispatch records yet"}</p><p className="mt-1 max-w-md text-xs leading-5 text-slate-500">{trips.length ? "Try another status or search term." : "Dispatches will appear here when trips are created from bookings."}</p>{trips.length > 0 && <button type="button" onClick={() => { setFilter("all"); setSearch(""); }} className="mt-3 text-xs font-bold text-rose-700 hover:text-rose-800">Clear filters</button>}</div>
+              : <div className="grid grid-cols-1 gap-2">{displayedTrips.map((trip) => {
+                const booking = bookingsById.get(String(trip.bookingId || trip.booking_id || ""));
+                const plan = routePlanFor(trip, booking || undefined);
+                const stops = pointsFor(trip, booking || undefined);
+                const tripBookingId = String(trip.bookingId || trip.booking_id || "");
+                const tripRoutePlanId = String(trip.routePlanId || trip.route_plan_id || "");
+                const parcelsForTrip = parcels.filter((parcel) => String(parcel.tripId || parcel.trip_id || "") === trip.id
+                  || Boolean(tripBookingId && String(parcel.bookingId || parcel.booking_id || "") === tripBookingId)
+                  || Boolean(tripRoutePlanId && String(parcel.routePlanId || parcel.route_plan_id || "") === tripRoutePlanId));
+                const origin = text(trip, "fromLocation", "from_location") || text(booking, "pickup_location", "pickupLocation") || plan?.pickupLocation || plan?.pickup_location || "Pickup not recorded";
+                const destination = text(trip, "toLocation", "to_location") || routeDetailsFor(plan).destination?.address || routeDetailsFor(plan).destination?.name || (stops.length ? pointName(stops[stops.length - 1]) : "Delivery not recorded");
+                const scheduledDeparture = trip.estimatedDeparture || field(trip, "estimated_departure", "scheduled_at") || routeDetailsFor(plan).schedule?.depart_at || plan?.plannedDeliveryDate || plan?.planned_delivery_date || booking?.bookingDate || field(booking, "booking_date");
+                return <button key={trip.id} type="button" aria-pressed={focusedTripId === trip.id} onClick={() => { suppressAutoFocusRef.current = false; setFocusedTripId(trip.id); setMapFocusRequest((request) => request + 1); }} className={`group min-w-0 rounded-xl border p-3 text-left shadow-[0_2px_8px_rgba(190,24,93,0.035)] transition duration-200 hover:border-rose-200 hover:bg-rose-50/20 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300 ${focusedTripId === trip.id ? "border-rose-400 bg-rose-50/40 ring-1 ring-rose-200" : "border-rose-100/90 bg-white"}`}>
+                  <div className="flex items-start justify-between gap-2"><div className="min-w-0"><p className="truncate font-mono text-[10px] font-bold text-rose-700">{trip.id}</p><p className="mt-1 truncate text-[10px] text-slate-400">Booking {trip.bookingId || trip.booking_id || "Not linked"}</p></div><StatusBadge trip={trip} /></div>
+                  <div className="mt-3 flex min-w-0 items-start gap-2"><MapPin className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" /><p className="min-w-0 text-xs font-bold leading-5 text-slate-900"><span className="line-clamp-1">{origin}</span><span className="my-0.5 flex items-center gap-1 text-[10px] font-medium text-slate-400"><ArrowRight className="h-3 w-3" />{planName(plan)}</span><span className="line-clamp-1">{destination}</span></p></div>
+                  <div className="mt-3 grid grid-cols-2 gap-2"><div className="rounded-xl bg-rose-50/50 px-2.5 py-2"><p className="text-[9px] font-bold uppercase tracking-wide text-slate-400">Driver</p><p className="mt-1 truncate text-[10px] font-semibold text-slate-800">{text(trip, "driverName", "driver_name") || "Unassigned"}</p></div><div className="rounded-xl bg-slate-50 px-2.5 py-2"><p className="text-[9px] font-bold uppercase tracking-wide text-slate-400">Vehicle</p><p className="mt-1 truncate text-[10px] font-semibold text-slate-800">{text(trip, "vehiclePlate", "vehicle_plate") || "Unassigned"}</p></div></div>
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-2.5 text-[9px] text-slate-500"><span className="inline-flex items-center gap-1"><Package className="h-3 w-3 text-rose-400" />{parcelsForTrip.length} parcels</span><span className="inline-flex items-center gap-1"><CalendarClock className="h-3 w-3 text-rose-400" />{formatDate(scheduledDeparture)}</span><span className="truncate">{routeDetailsFor(plan).priority || "Normal"} priority</span></div>
+                  {numeric(trip, "progress") != null && <div className="mt-2.5"><div className="mb-1 flex justify-between text-[9px] text-slate-400"><span>Progress</span><span>{Math.max(0, Math.min(100, Number(trip.progress)))}%</span></div><div className="h-1.5 overflow-hidden rounded-full bg-rose-100"><div className="h-full rounded-full bg-rose-500 transition-all" style={{ width: `${Math.max(0, Math.min(100, Number(trip.progress)))}%` }} /></div></div>}
+                  <div className="mt-2 flex items-center justify-end gap-1 text-[10px] font-bold text-rose-600 opacity-0 transition group-hover:opacity-100">Focus route <ArrowRight className="h-3 w-3" /></div>
+                </button>;
+              })}</div>}
           </section>
-
-          {/* Main mission workspace */}
-          {activeSection === "summary" ? (
-            <section className="grid gap-6 lg:grid-cols-[1.25fr_0.75fr]">
-              <div className="rounded-[28px] border border-pink-100 bg-white/75 p-6 shadow-[0_18px_40px_rgba(190,24,93,0.07),inset_1px_1px_0_rgba(255,255,255,0.95)]">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="text-[10px] font-black uppercase tracking-[0.2em] text-pink-600">Mission pulse</p>
-                    <h2 className="mt-2 text-xl font-black text-slate-900">Dispatch at a glance</h2>
-                    <p className="mt-2 max-w-xl text-sm leading-relaxed text-slate-600">Use the sections above to move from the operational summary into the delivery queue or a full live map without losing your current mission selection.</p>
-                  </div>
-                  <span className="hidden rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-[10px] font-black uppercase tracking-wider text-emerald-700 sm:inline-flex">Live tracking</span>
-                </div>
-                <div className="mt-6 grid gap-3 sm:grid-cols-3">
-                  <button type="button" onClick={() => setActiveSection("list")} className="rounded-2xl border border-pink-100 bg-pink-50/70 p-4 text-left transition hover:-translate-y-0.5 hover:border-pink-300">
-                    <span className="material-symbols-outlined text-pink-600">format_list_bulleted</span>
-                    <p className="mt-2 text-sm font-black text-slate-900">Open delivery list</p>
-                    <p className="mt-1 text-xs text-slate-500">Review priority, ETA, and vehicle state.</p>
-                  </button>
-                  <button type="button" onClick={() => setActiveSection("map")} className="rounded-2xl border border-pink-100 bg-pink-50/70 p-4 text-left transition hover:-translate-y-0.5 hover:border-pink-300">
-                    <span className="material-symbols-outlined text-pink-600">map</span>
-                    <p className="mt-2 text-sm font-black text-slate-900">Open live map</p>
-                    <p className="mt-1 text-xs text-slate-500">Inspect routes, markers, and driver positions.</p>
-                  </button>
-                  <div className="rounded-2xl border border-slate-100 bg-slate-50/80 p-4">
-                    <span className="material-symbols-outlined text-amber-500">priority_high</span>
-                    <p className="mt-2 text-sm font-black text-slate-900">Attention needed</p>
-                    <p className="mt-1 text-xs text-slate-500">{critical ? `${critical.driverName || critical.name || "A mission"} is the current priority.` : "No critical mission is active."}</p>
-                  </div>
-                </div>
-              </div>
-              <div className="rounded-[28px] border border-pink-100 bg-gradient-to-br from-pink-50/80 to-white/80 p-6 shadow-[0_18px_40px_rgba(190,24,93,0.07)]">
-                <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Current focus</p>
-                <h2 className="mt-2 text-xl font-black text-slate-900">{critical ? "Critical mission" : "Fleet is steady"}</h2>
-                <p className="mt-2 text-sm leading-relaxed text-slate-600">{critical ? critical.parcelSummary : "There are no rush deliveries requiring immediate intervention."}</p>
-                {critical && <button type="button" onClick={() => setSelectedDeliveryId(critical.id)} className="mt-5 rounded-xl bg-pink-600 px-4 py-2 text-xs font-black text-white shadow-[0_8px_18px_rgba(190,24,93,0.2)]">Inspect priority mission</button>}
-              </div>
-            </section>
-          ) : activeSection === "list" ? (
-            <div className="space-y-8">
-              <section className="space-y-8">
-                <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                  <div>
-                    <h2 className="text-xl font-bold text-slate-900">Live delivery queue</h2>
-                    <p className="text-sm text-slate-600">Prioritized deliveries in progress with ETA and vehicle status.</p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setShowRouteLines((visible) => !visible)}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-pink-200 px-3 py-1.5 text-xs font-semibold text-pink-700 hover:bg-pink-50"
-                      title={showRouteLines ? "Hide direction lines and track markers" : "Show optimized direction lines"}
-                    >
-                      <span className="material-symbols-outlined text-[16px]">{showRouteLines ? "route" : "location_searching"}</span>
-                      {showRouteLines ? "Hide Route" : "Track Vehicles / Parcels"}
-                    </button>
-                    <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-pink-600">
-                      <span className="material-symbols-outlined text-[18px]">traffic</span>
-                      {DELIVERIES.length} active routes
-                    </div>
-                  </div>
-                </div>
-
-                {DELIVERIES.length === 0 ? (
-                  <p className="py-8 text-slate-500">No in-transit deliveries with an assigned driver and vehicle yet.</p>
-                ) : (
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
-                      {[...(critical ? [critical] : []), ...others].map((delivery) => (
-                        <DeliveryCard
-                          key={delivery.id}
-                          delivery={delivery}
-                          isSelected={selectedDeliveryId === delivery.id}
-                          onSelect={setSelectedDeliveryId}
-                        />
-                      ))}
-                  </div>
-                )}
-
-              </section>
-            </div>
-          ) : (
-            <section className="space-y-4">
-              <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                <div>
-                  <h2 className="text-xl font-bold text-slate-900">Live fleet map</h2>
-                  <p className="text-sm text-slate-600">All active delivery assets and critical locations in one view.</p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setShowRouteLines((visible) => !visible)}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-pink-200 px-3 py-1.5 text-xs font-semibold text-pink-700 hover:bg-pink-50"
-                    title={showRouteLines ? "Hide direction lines and track markers" : "Show optimized direction lines"}
-                  >
-                    <span className="material-symbols-outlined text-[16px]">{showRouteLines ? "route" : "location_searching"}</span>
-                    {showRouteLines ? "Hide Route" : "Track Vehicles / Parcels"}
-                  </button>
-                  <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-pink-600">
-                    <span className="material-symbols-outlined text-[18px]">public</span>
-                    {DELIVERIES.length || 0} vehicles tracked
-                  </div>
-                </div>
-              </div>
-
-              <div className="h-[720px] w-full">
-                <LeafletMap 
-                  center={HUB_POS} 
-                  zoom={11} 
-                  markers={markers} 
-                  coloredPaths={showRouteLines || selectedDeliveryId ? coloredPaths : []} 
-                  onlyColoredPaths
-                  routeColor="#ec4899" 
-                  onMarkerClick={(marker) => {
-                    setActiveMarker(marker);
-                    const deliveryId = DELIVERIES.find((delivery) =>
-                      marker.id === delivery.id || marker.id.startsWith(`${delivery.id}-`)
-                    )?.id;
-                    setSelectedDeliveryId(deliveryId || marker.id);
-                  }}
-                />
-                {selectedOsrmError && (
-                  <div className="pointer-events-none absolute bottom-3 left-3 z-[400] rounded-lg border border-amber-200 bg-white/95 px-3 py-2 text-xs font-semibold text-amber-800 shadow-sm">
-                    OSRM: {selectedOsrmError}
-                  </div>
-                )}
-              </div>
-            </section>
-          )}
         </div>
       </main>
+
+      {selectedTrip && <div className="fixed inset-0 z-[1300] flex items-center justify-center bg-slate-950/45 p-3 backdrop-blur-sm sm:p-5" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedTripId(null); }}>
+        <section role="dialog" aria-modal="true" aria-labelledby="dispatch-detail-heading" className="max-h-[94vh] w-full max-w-4xl overflow-y-auto rounded-2xl border border-rose-100 bg-white shadow-2xl">
+          <header className="sticky top-0 z-10 flex items-start justify-between gap-3 border-b border-rose-100 bg-white/95 p-4 backdrop-blur sm:p-5"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h2 id="dispatch-detail-heading" className="font-mono text-sm font-extrabold text-slate-900">{selectedTrip.id}</h2><StatusBadge trip={selectedTrip} /></div><p className="mt-1 text-xs text-slate-500">{planName(selectedPlan)}{selectedBooking ? ` · Booking ${selectedBooking.id}` : ""}</p></div><button type="button" aria-label="Close dispatch details" onClick={() => setSelectedTripId(null)} className="rounded-lg p-2 text-slate-400 transition hover:bg-rose-50 hover:text-rose-700"><X className="h-4 w-4" /></button></header>
+          <div className="space-y-5 p-4 sm:p-5">
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><InfoCell label="Driver" value={text(selectedTrip, "driverName", "driver_name") || "Unassigned"} icon={UserRound} /><InfoCell label="Vehicle" value={text(selectedTrip, "vehiclePlate", "vehicle_plate") || "Unassigned"} icon={Truck} /><InfoCell label="Priority" value={String(selectedPlanDetails.priority || field(selectedTrip, "priority") || "Normal")} icon={Activity} /><InfoCell label="Parcel load" value={`${numeric(selectedTrip, "loadKg", "load_kg") ?? selectedTripParcels.reduce((sum, parcel) => sum + (Number(parcel.weightKg ?? parcel.weight_kg) || 0), 0)} kg · ${selectedTripParcels.length} parcels`} icon={Package} /></div>
+
+            <section className="grid gap-2 sm:grid-cols-2"><InfoCell label="Pickup location" value={text(selectedTrip, "fromLocation", "from_location") || text(selectedBooking, "pickup_location", "pickupLocation") || selectedPlan?.pickupLocation || selectedPlan?.pickup_location || "Not recorded"} icon={MapPin} /><InfoCell label="Delivery location" value={text(selectedTrip, "toLocation", "to_location") || selectedPlanDetails.destination?.address || selectedPlanDetails.destination?.name || (selectedStops.length ? pointName(selectedStops[selectedStops.length - 1]) : "Not recorded")} icon={MapPin} /><InfoCell label="Scheduled departure" value={formatDate(selectedTrip.estimatedDeparture || field(selectedTrip, "estimated_departure", "scheduled_at") || selectedPlanDetails.schedule?.depart_at || selectedPlan?.plannedDeliveryDate || selectedPlan?.planned_delivery_date || selectedBooking?.bookingDate)} icon={CalendarClock} /><InfoCell label="Expected arrival" value={formatDate(selectedTrip.estimatedArrival || field(selectedTrip, "estimated_arrival", "eta_at") || selectedPlanDetails.schedule?.expected_arrival)} icon={Clock3} /><InfoCell label="Created" value={formatDate(selectedTrip.createdAt || field(selectedTrip, "created_at"))} icon={Clock3} /><InfoCell label="Last updated" value={formatDate(selectedTrip.updatedAt || field(selectedTrip, "updated_at"))} icon={RefreshCw} /><InfoCell label="Pickup confirmed" value={formatDate(selectedTrip.pickupConfirmedAt || field(selectedTrip, "pickup_confirmed_at"))} icon={CheckCircle2} /><InfoCell label="Completed" value={formatDate(field(selectedTrip, "completed_at", "actualArrival", "actual_arrival"))} icon={Check} /><InfoCell label="Pickup status" value={String(selectedTrip.pickupStatus || field(selectedTrip, "pickup_status") || "Pending").replace(/[_-]+/g, " ")} icon={CheckCircle2} /><InfoCell label="Distance / duration" value={`${numeric(selectedTrip, "distanceKm", "distance_km") ?? selectedPlan?.optimizedDistanceKm ?? selectedPlan?.distanceKm ?? "Not recorded"}${numeric(selectedTrip, "distanceKm", "distance_km") != null || selectedPlan?.optimizedDistanceKm != null || selectedPlan?.distanceKm != null ? " km" : ""} · ${numeric(selectedTrip, "durationMinutes", "duration_minutes") ?? selectedPlan?.optimizedDurationMinutes ?? selectedPlan?.durationMinutes ?? "Not recorded"}${numeric(selectedTrip, "durationMinutes", "duration_minutes") != null || selectedPlan?.optimizedDurationMinutes != null || selectedPlan?.durationMinutes != null ? " min" : ""}`} icon={Route} /></section>
+
+            {selectedStops.length > 0 && <section><div className="mb-2 flex items-center gap-2"><Route className="h-4 w-4 text-rose-500" /><h3 className="text-xs font-bold text-slate-800">Route plan · {planName(selectedPlan)}</h3></div><ol className="space-y-2">{selectedStops.map((stop, index) => <li key={`${stop.id || stop.name || stop.address}-${index}`} className="flex items-start gap-3 rounded-xl border border-slate-100 bg-slate-50/70 p-3"><span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-rose-100 text-[10px] font-bold text-rose-700">{index + 1}</span><div className="min-w-0 flex-1"><p className="text-xs font-semibold text-slate-800">{pointName(stop)}</p>{stop.address && <p className="mt-0.5 break-words text-[10px] text-slate-500">{stop.address}</p>}<p className="mt-1 text-[9px] text-slate-400">{stop.arrival ? `Arrival ${formatDate(stop.arrival)}` : "Arrival time not recorded"}{stop.durationMinutes ? ` · ${stop.durationMinutes} min stop` : ""}</p></div></li>)}</ol></section>}
+
+            <section><div className="mb-2 flex items-center justify-between"><h3 className="text-xs font-bold text-slate-800">Parcel manifest</h3><span className="text-[10px] text-slate-400">{selectedTripParcels.length} records</span></div>{selectedTripParcels.length ? <div className="grid gap-2 sm:grid-cols-2">{selectedTripParcels.map((parcel) => <article key={parcel.id} className="min-w-0 rounded-xl border border-slate-100 bg-white p-3"><div className="flex items-start justify-between gap-2"><p className="truncate font-mono text-[10px] font-bold text-rose-700">{text(parcel, "trackingNumber", "tracking_number") || parcel.id}</p><span className="shrink-0 rounded-full bg-slate-100 px-2 py-1 text-[9px] font-semibold text-slate-600">{String(parcel.status || "Unknown").replace(/[_-]+/g, " ")}</span></div><p className="mt-1 text-[10px] text-slate-700">{text(parcel, "recipientName", "recipient_name") || "Recipient not recorded"}</p><p className="mt-1 line-clamp-2 text-[10px] text-slate-500">{text(parcel, "destinationAddress", "delivery_address", "destination") || "Delivery address not recorded"}</p><p className="mt-1 text-[9px] text-slate-400">{Number(parcel.weightKg ?? parcel.weight_kg) || 0} kg</p></article>)}</div> : <p className="rounded-xl border border-dashed border-slate-200 px-3 py-4 text-center text-[10px] text-slate-500">No linked parcel records were returned for this dispatch.</p>}</section>
+
+          </div>
+        </section>
+      </div>}
+
       <GlobalFooter />
-
-      {/* Inline Marker Detail Overlay */}
-      {activeMarker && (() => {
-        const deliveryFromMarker = DELIVERIES.find((d) => activeMarker.id === d.id || activeMarker.id.startsWith(`${d.id}-`));
-        const isDeliveryMarker = Boolean(deliveryFromMarker);
-
-        return (
-          <div className="fixed bottom-6 right-6 z-50 max-w-sm space-y-3 bg-white p-4 shadow-2xl">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[10px] font-bold uppercase tracking-wider text-pink-600">
-                  {isDeliveryMarker ? "Mission Info" : "Marker details"}
-                </p>
-                <h4 className="text-base font-bold text-slate-900">
-                  {isDeliveryMarker
-                    ? (deliveryFromMarker?.driverName || deliveryFromMarker?.name || deliveryFromMarker?.courier || activeMarker.meta?.title || "Mission")
-                    : (activeMarker.meta?.title || activeMarker.meta?.subtitle || "Mission")}
-                </h4>
-                {activeMarker.meta?.subtitle && (
-                  <p className="text-xs text-slate-600">{activeMarker.meta.subtitle}</p>
-                )}
-              </div>
-              <button type="button" onClick={() => setActiveMarker(null)} className="text-xs font-semibold text-slate-400 hover:text-slate-700">
-                ✕
-              </button>
-            </div>
-            <div className="space-y-2 text-xs text-slate-600">
-              {isDeliveryMarker && deliveryFromMarker ? (
-                <>
-                  <div className="flex justify-between gap-3">
-                    <span>Courier:</span>
-                    <span className="font-semibold text-slate-900 text-right">{deliveryFromMarker.courier || "Unassigned"}</span>
-                  </div>
-                  <div className="flex justify-between gap-3">
-                    <span>Driver:</span>
-                    <span className="font-semibold text-slate-900 text-right">{deliveryFromMarker.driverName}</span>
-                  </div>
-                  <div className="flex justify-between gap-3">
-                    <span>Parcel count:</span>
-                    <span className="font-semibold text-slate-900 text-right">{deliveryFromMarker.parcelCount}</span>
-                  </div>
-                  <div className="pt-2 border-t border-slate-200">
-                    <div className="font-semibold text-slate-900 mb-1">Parcel details</div>
-                    <div className="space-y-1">
-                      {deliveryFromMarker.parcelDetails && deliveryFromMarker.parcelDetails.length > 0 ? (
-                        deliveryFromMarker.parcelDetails.map((detail, idx) => (
-                          <div key={idx} className="break-words text-[11px] leading-relaxed text-slate-700">{detail}</div>
-                        ))
-                      ) : (
-                        <div className="text-[11px] text-slate-500">No parcel details available.</div>
-                      )}
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <>
-                  {activeMarker.meta?.details}
-                  <div className="text-slate-500">Location details are shown for this map marker.</div>
-                </>
-              )}
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Delivery Detail Panel - Shows coordinates and route info when card is selected */}
-      {selectedDelivery && (
-        <div className="fixed bottom-6 left-6 z-50 max-w-md space-y-4 bg-white p-5 rounded-2xl shadow-2xl border border-pink-200">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <p className="text-[10px] font-bold uppercase tracking-wider text-pink-600">Mission Info</p>
-              <h4 className="text-base font-bold text-slate-900">{selectedDelivery.driverName || selectedDelivery.courier || "Mission"}</h4>
-              <p className="text-xs text-slate-500 mt-0.5">{selectedDelivery.destination}</p>
-            </div>
-            <button 
-              type="button" 
-              onClick={() => setSelectedDeliveryId(null)} 
-              className="text-xs font-semibold text-slate-400 hover:text-slate-700"
-            >
-              ✕
-            </button>
-          </div>
-
-          <div className="space-y-3 text-xs">
-            <div className="space-y-2">
-              <div className="font-semibold text-slate-900">Delivery Details</div>
-              <div className="space-y-1 text-slate-600">
-                <div className="flex justify-between gap-3">
-                  <span>Courier:</span>
-                  <span className="font-semibold text-slate-900 text-right">{selectedDelivery.courier || "Unassigned"}</span>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <span>Driver:</span>
-                  <span className="font-semibold text-slate-900 text-right">{selectedDelivery.driverName}</span>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <span>Parcel Count:</span>
-                  <span className="font-semibold text-slate-900 text-right">{selectedDelivery.parcelCount || Number.parseInt(selectedDelivery.parcelSummary.match(/\d+/)?.[0] ?? "0", 10) || 0}</span>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <span>Status:</span>
-                  <span className="font-semibold text-slate-900 text-right">{selectedDelivery.progress}% Complete</span>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <span>ETA:</span>
-                  <span className="font-semibold text-slate-900 text-right">{formatEta(selectedDelivery.etaMinutes)}</span>
-                </div>
-              </div>
-            </div>
-
-            <div className="space-y-2 pt-2 border-t border-slate-200">
-              <div className="font-semibold text-slate-900">Parcel Details</div>
-              <div className="space-y-1 text-slate-600 bg-slate-50 p-2 rounded">
-                {selectedDelivery.parcelDetails && selectedDelivery.parcelDetails.length > 0 ? (
-                  selectedDelivery.parcelDetails.map((detail, idx) => (
-                    <div key={idx} className="break-words text-[11px] leading-relaxed text-slate-700">{detail}</div>
-                  ))
-                ) : (
-                  <div className="text-[11px] text-slate-500">No parcel details available.</div>
-                )}
-              </div>
-            </div>
-
-            <div className="space-y-1 pt-2 border-t border-slate-200 text-slate-600">
-              <div className="font-semibold text-slate-900">Route</div>
-              <div>{selectedDelivery.origin} → {selectedDelivery.destination}</div>
-              {selectedDelivery.stops && selectedDelivery.stops.length > 0 && (
-                <div className="text-[10px]">
-                  <div className="font-semibold text-slate-700 mt-1">Stops ({selectedDelivery.stops.length}):</div>
-                  <div className="space-y-0.5 mt-1">
-                    {selectedDelivery.stops.map((stop, idx) => (
-                      <div key={idx} className="text-slate-500">
-                        {idx + 1}. {stop.name}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
-
-type LatLng = { lat: number; lng: number };
-
-type Delivery = {
-  id: string;
-  name: string;
-  vehiclePlate: string;
-  parcelSummary: string;
-  parcelCount: number;
-  parcelDetails: string[];
-  origin: string;
-  destination: string;
-  originPos: LatLng;
-  destPos: LatLng;
-  currentPos: LatLng;
-  progress: number;
-  etaMinutes: number;
-  driverName: string;
-  driverPhone?: string | null;
-  status: "critical" | "in-transit" | "approaching" | "completed" | "cancelled";
-  bookingId: string;
-  courier?: string;
-  // Ordered waypoints (e.g. the courier warehouses an OR-Tools-optimized
-  // bulk route visits, in visiting order) between origin and destination.
-  stops?: { name: string; lat: number; lng: number; status?: string }[];
-  routePlanPolyline?: LatLng[] | null;
-};
-
-function StatItem({
-  icon,
-  label,
-  value,
-  sub,
-}: {
-  icon: string;
-  label: string;
-  value: string;
-  sub?: React.ReactNode;
-}) {
-  return (
-    <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-      <div className="flex items-center gap-2 text-xs font-medium text-slate-500">
-        <span className="material-symbols-outlined text-pink-600 text-[18px]">{icon}</span>
-        {label}
-      </div>
-      <div className="text-3xl font-extrabold text-slate-900">{value}</div>
-      {sub && <div className="text-xs font-semibold text-pink-600">{sub}</div>}
-    </div>
-  );
-}
-
-function formatEta(min: number) {
-  if (!Number.isFinite(min) || min <= 0) return "—";
-  if (min >= 60) {
-    const h = Math.floor(min / 60);
-    const m = min % 60;
-    return `${h}h ${m}m`;
-  }
-  return `${min}m`;
-}
-
-const DELIVERY_STATUS_LABEL: Record<Delivery["status"], string> = {
-  critical: "In Transit",
-  "in-transit": "In Transit",
-  approaching: "Approaching",
-  completed: "Completed",
-  cancelled: "Cancelled",
-};
-
-function DeliveryCard({ delivery, isSelected, onSelect }: { delivery: Delivery; isSelected?: boolean; onSelect?: (id: string) => void }) {
-  if (delivery.status === "critical") {
-    return (
-      <>
-      <article 
-        onClick={() => onSelect?.(delivery.id)}
-        className={`rounded-lg border p-4 cursor-pointer transition-colors ${
-          isSelected 
-            ? 'border-rose-600 bg-rose-50' 
-            : 'border-slate-200 bg-white hover:shadow-md'
-        }`}
-      >
-        <div className="space-y-3">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="inline-flex items-center gap-1.5 text-xs font-bold text-rose-600">
-                <span className="material-symbols-outlined text-[16px]">warning</span>
-                RUSH PRIORITY
-              </div>
-              <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Courier</p>
-              <h3 className="text-base font-bold text-slate-900 mt-1">{delivery.driverName || delivery.name}</h3>
-              <p className="text-xs text-slate-500">{delivery.vehiclePlate || "Vehicle not assigned"}</p>
-            </div>
-            <div className="text-right">
-              <div className="text-xl font-bold text-rose-600">{formatEta(delivery.etaMinutes)}</div>
-              <div className="text-[10px] font-bold uppercase text-slate-400">ETA</div>
-            </div>
-          </div>
-
-          <div className="h-1.5 w-full bg-slate-100 overflow-hidden">
-            <div className="h-full bg-rose-600 transition-all" style={{ width: `${delivery.progress}%` }} />
-          </div>
-
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="font-semibold text-rose-600">RUSH PRIORITY</span>
-            <span className="font-medium text-slate-500">{delivery.progress}% complete</span>
-          </div>
-        </div>
-      </article>
-      </>
-    );
-  }
-
-  return (
-    <>
-    <article 
-      onClick={() => onSelect?.(delivery.id)}
-      className={`rounded-lg border p-4 cursor-pointer transition-colors ${
-        isSelected 
-          ? 'border-pink-600 bg-pink-50' 
-          : 'border-slate-200 bg-white hover:shadow-md'
-      }`}
-    >
-      <div className="space-y-3">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Courier</p>
-            <h3 className="text-base font-bold text-slate-900">{delivery.driverName || delivery.name}</h3>
-            <p className="text-xs text-slate-500">{delivery.vehiclePlate || "Vehicle not assigned"}</p>
-          </div>
-          <div className="text-right">
-            <div className="text-lg font-bold text-pink-600">{formatEta(delivery.etaMinutes)}</div>
-            <div className="text-[10px] font-bold uppercase text-slate-400">ETA</div>
-          </div>
-        </div>
-
-        <div className="h-1.5 w-full bg-slate-100 overflow-hidden">
-          <div className="h-full bg-pink-600 transition-all" style={{ width: `${delivery.progress}%` }} />
-        </div>
-
-        <div className="flex items-center justify-between text-xs pt-1">
-          <span className="font-semibold text-pink-600">
-            {DELIVERY_STATUS_LABEL[delivery.status]} • {delivery.progress}%
-          </span>
-          <span className="font-medium text-slate-500">ETA shown above</span>
-        </div>
-      </div>
-    </article>
-    </>
-  );
-}
-

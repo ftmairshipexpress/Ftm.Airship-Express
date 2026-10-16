@@ -1,5 +1,4 @@
 import { supabase } from "./supabaseClient";
-import { parcelSupabase } from "./parcelSupabaseClient";
 
 export async function fetchJson(path: string, opts: RequestInit = {}) {
   const url = path.startsWith("http") ? path : path.startsWith("/") ? path : `/${path}`;
@@ -43,17 +42,6 @@ async function readSupabaseTable<T = Record<string, unknown>>(table: string, sel
 }
 
 readSupabaseTable.unavailableTables = new Set<string>();
-
-async function readParcelTable<T = Record<string, unknown>>(table: string, select = "*") {
-  try {
-    const { data, error } = await parcelSupabase.from(table).select(select).limit(200);
-    if (error) throw error;
-    return (Array.isArray(data) ? data : []) as T[];
-  } catch (error) {
-    console.warn(`[api] parcel table ${table} unavailable`, error);
-    return [] as T[];
-  }
-}
 
 function normalizeStatus(value: unknown) {
   const raw = String(value ?? "").trim().toLowerCase();
@@ -189,11 +177,11 @@ export async function getFuelLogs() {
 }
 
 export async function getPendingParcelsByCourier() {
-  return readParcelTable<any>("parcels", "*");
+  return fetchJson("/api/parcels/pending-by-courier");
 }
 
 export async function getInventoryItems() {
-  return readParcelTable<any>("inventory_items", "*");
+  return fetchJson("/api/inventory");
 }
 
 export async function getIncidentReports() {

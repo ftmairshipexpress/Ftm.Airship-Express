@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createFtmAuthClient, createFtmServiceClient } from "../../../../lib/server/ftmSupabase";
+import { getAirshipCouriers } from "../../../../lib/server/ftmCourier";
 
 export const dynamic = "force-dynamic";
 
@@ -20,10 +21,13 @@ export async function POST(request: Request) {
   const service = createFtmServiceClient();
   if (!service) return NextResponse.json({ error: "Auth service is not configured" }, { status: 503 });
 
-  const { data: courier, error: courierError } = await service.from("couriers").select("id").eq("id", courier_id).eq("is_active", true).maybeSingle();
-  if (courierError || !courier) return NextResponse.json({ error: "courier_id must reference an active registered courier." }, { status: 400 });
+  let airshipCourier;
+  try { airshipCourier = (await getAirshipCouriers(service)).find((courier) => courier.id === courier_id); } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unable to load Airship Express courier." }, { status: 500 });
+  }
+  if (!airshipCourier) return NextResponse.json({ error: "Drivers can only be registered for Airship Express." }, { status: 400 });
 
-  const metadata = { full_name, phone, role: "driver", courier_id };
+  const metadata = { full_name, phone, role: "driver", courier_id: airshipCourier.id };
   const created = process.env.NODE_ENV === "production"
     ? await authClient.auth.signUp({ email, password, options: { data: metadata } })
     : await service.auth.admin.createUser({ email, password, email_confirm: true, user_metadata: metadata });
@@ -40,7 +44,7 @@ export async function POST(request: Request) {
     full_name,
     phone: phone || null,
     role: "driver",
-    courier_id,
+    courier_id: airshipCourier.id,
     vehicle_id: null,
   };
   const { data, error } = await service.from("users").upsert([profile], { onConflict: "id" }).select("*").maybeSingle();

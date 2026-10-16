@@ -1,5 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
-  "installCommand": "npm ci --prefix .. && npm ci"
+  "installCommand": "npm ci --prefix .. && npm ci",
+  "crons": [
+    {
+      "path": "/api/maintenance/automation",
+      "schedule": "0 1 * * *"
+    }
+  ]
 }

@@ -4,6 +4,7 @@ import { hasPermission } from "../../../../lib/permissions";
 import { authenticateFtmRequest } from "../../../../lib/server/ftmRequestAuth";
 import { createFtmParcelClient } from "../../../../lib/server/ftmSupabase";
 import { normalizeBooking, validateBookingAssignment } from "../../../../lib/server/ftmBookings";
+import { isAirshipCourier } from "../../../../lib/server/ftmCourier";
 
 export const dynamic = "force-dynamic";
 
@@ -118,6 +119,9 @@ export async function PATCH(request: Request, { params }: { params: { id: string
     validation = await validateBookingAssignment(supabase, bookingBefore, driver_id, vehicle_id, body.courier_id || body.courier);
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Driver and vehicle are not eligible for this booking." }, { status: 409 });
+  }
+  if (!isAirshipCourier(validation.courier.name || validation.courier.code)) {
+    return NextResponse.json({ error: "Only Airship Express bookings can be assigned from VRDS." }, { status: 409 });
   }
 
   const assignedAt = new Date().toISOString();

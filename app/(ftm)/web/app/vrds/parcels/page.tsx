@@ -4,8 +4,8 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import GlobalNavbar from "../../components/GlobalNavbar";
 import GlobalFooter from "../../components/GlobalFooter";
 import { SkeletonTable } from "../../components/PageSkeleton";
-import { useParcelStore, receiveParcel, bulkDeliverParcels, refreshStoreFromBackend } from "../../lib/parcelStore";
-import { getTrips, updateParcelStatus } from "../../lib/api";
+import { useParcelStore, bulkDeliverParcels, refreshStoreFromBackend } from "../../lib/parcelStore";
+import { fetchJson, getTrips, updateParcelStatus } from "../../lib/api";
 import { COURIER_NAMES, CourierName, isOperationalTrip, Parcel, ParcelType, PARCEL_STATUS_LABEL } from "../../lib/parcelTypes";
 import { QRCodeSVG } from "qrcode.react";
 import { getParcelGroupKey } from "../../lib/parcelGrouping";
@@ -22,26 +22,11 @@ const PARCEL_TYPES: ParcelType[] = [
 const COURIER_OPTIONS: CourierName[] = Array.from(COURIER_NAMES) as CourierName[];
 
 function normalizeCourier(value: unknown): CourierName {
-  const raw = String(value ?? "").trim().toLowerCase();
-  if (raw.includes("shopee")) return "ShopeeXpress";
-  if (raw.includes("j&t") || raw.includes("jnt")) return "JNT Express";
-  if (raw.includes("lazada")) return "Lazada Express";
-  if (raw.includes("flash")) return "Flash Express";
-  if (raw.includes("tiktok")) return "TikTok Delivery";
-  if (raw.includes("lbc")) return "LBC";
-  if (raw.includes("gogo")) return "GOGO Xpress";
-  if (raw.includes("air21") || raw.includes("airship")) return "Airship Express";
-  return COURIER_OPTIONS.find((courier) => courier.toLowerCase() === raw) ?? "LBC";
+  void value;
+  return "Airship Express";
 }
 
 const COURIER_BRANDING: Record<CourierName, { label: string; badge: string; accent: string; icon: string }> = {
-  "ShopeeXpress": { label: "Shopee Xpress", badge: "bg-orange-50 text-orange-700 border-orange-200", accent: "bg-orange-500 text-white", icon: "S" },
-  "JNT Express": { label: "J&T Express", badge: "bg-rose-50 text-rose-700 border-rose-200", accent: "bg-rose-600 text-white", icon: "J" },
-  "Lazada Express": { label: "Lazada Express", badge: "bg-indigo-50 text-indigo-700 border-indigo-200", accent: "bg-indigo-600 text-white", icon: "L" },
-  "Flash Express": { label: "Flash Express", badge: "bg-amber-50 text-amber-800 border-amber-200", accent: "bg-amber-500 text-white", icon: "F" },
-  "TikTok Delivery": { label: "TikTok Delivery", badge: "bg-slate-100 text-slate-800 border-slate-200", accent: "bg-slate-900 text-white", icon: "T" },
-  "LBC": { label: "LBC Express", badge: "bg-red-50 text-red-700 border-red-200", accent: "bg-red-600 text-white", icon: "L" },
-  "GOGO Xpress": { label: "GOGO Xpress", badge: "bg-pink-50 text-pink-700 border-pink-200", accent: "bg-pink-600 text-white", icon: "G" },
   "Airship Express": { label: "Airship Express", badge: "bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200", accent: "bg-fuchsia-600 text-white", icon: "A" },
 };
 
@@ -174,7 +159,7 @@ export default function VrdsParcelsPage() {
   const [toast, setToast] = useState<string | null>(null);
   const [searchText, setSearchText] = useState("");
   const [filterStatus, setFilterStatus] = useState<StatusFilter>("All");
-  const [selectedCourier, setSelectedCourier] = useState<CourierName | "">("");
+  const [selectedCourier, setSelectedCourier] = useState<CourierName | "">("Airship Express");
   const [selectedLocation, setSelectedLocation] = useState<string>("");
   const [sortBy, setSortBy] = useState<SortOption>("Newest");
   const [viewMode, setViewMode] = useState<"grid" | "stream">("grid");
@@ -815,7 +800,7 @@ export default function VrdsParcelsPage() {
                     No trips found for the selected courier.
                   </div>
                 ) : courierTrips.map(({ trip, parcels: tripParcels, courier, parcelCount }) => {
-                  const brand = COURIER_BRANDING[courier] ?? COURIER_BRANDING.LBC;
+                  const brand = COURIER_BRANDING[courier] ?? COURIER_BRANDING["Airship Express"];
                   const driverId = trip.driverId ?? trip.driver_id ?? trip.driver;
                   const assignedDriver = drivers.find((item) => String(item.id) === String(driverId));
                   const driver = trip.driverName || trip.driver_name || assignedDriver?.name || assignedDriver?.full_name || (driverId ? `Driver ${driverId}` : "Driver not assigned");
@@ -962,9 +947,9 @@ function ParcelCard({
   onToggle: () => void;
   onOpenDetail: () => void;
 }) {
-  const rawCourier = (parcel as any).courier ?? (parcel as any).courier_name ?? "LBC";
+  const rawCourier = (parcel as any).courier ?? (parcel as any).courier_name ?? "Airship Express";
   const brand = COURIER_BRANDING[rawCourier as CourierName] ?? {
-    label: String(rawCourier || "LBC"),
+    label: "Airship Express",
     badge: "bg-pink-50 text-pink-700 border-pink-200",
     accent: "bg-pink-600 text-white",
     icon: String((rawCourier || "L").toString().charAt(0)).toUpperCase(),
@@ -1190,9 +1175,10 @@ function ReceiveParcelModal({
   const [destinationAddress, setDestinationAddress] = useState("");
   const [parcelType, setParcelType] = useState<ParcelType>("Document");
   const [weightKg, setWeightKg] = useState("1.0");
-  const [courier, setCourier] = useState<CourierName>("LBC");
+  const [courier, setCourier] = useState<CourierName>("Airship Express");
   const [notes, setNotes] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const [destLatInput, setDestLatInput] = useState("");
   const [destLngInput, setDestLngInput] = useState("");
@@ -1228,21 +1214,31 @@ function ReceiveParcelModal({
       }
     }
 
-    const parcel = receiveParcel({
-      senderName,
-      senderPhone,
-      recipientName,
-      recipientPhone,
-      destinationAddress,
-      destLat: Number.isFinite(lat) ? lat : 14.5995,
-      destLng: Number.isFinite(lng) ? lng : 120.9745,
-      parcelType,
-      weightKg: weight,
-      courier,
-      notes,
-    });
-
-    onReceived(parcel.trackingNumber);
+    setSaving(true);
+    try {
+      const saved = await fetchJson("/api/parcels", {
+        method: "POST",
+        body: JSON.stringify({
+          sender_name: senderName,
+          sender_phone: senderPhone,
+          recipient_name: recipientName,
+          recipient_phone: recipientPhone,
+          delivery_address: destinationAddress,
+          dest_lat: Number.isFinite(lat) ? lat : 14.5995,
+          dest_lng: Number.isFinite(lng) ? lng : 120.9745,
+          parcel_type: parcelType,
+          weight_kg: weight,
+          courier,
+          notes,
+        }),
+      });
+      await refreshStoreFromBackend({ history: true });
+      onReceived(String(saved.tracking_number || saved.trackingNumber || "parcel"));
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Unable to register parcel in FTM Supabase.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -1375,16 +1371,20 @@ function ReceiveParcelModal({
 
         <div className="mt-6 flex items-center justify-end gap-3 border-t border-pink-100 pt-4">
           <button
+            type="button"
             onClick={onClose}
+            disabled={saving}
             className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50 transition"
           >
             Cancel
           </button>
           <button
+            type="button"
             onClick={submit}
-            className="rounded-xl bg-pink-600 px-5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-pink-700 transition"
+            disabled={saving}
+            className="rounded-xl bg-pink-600 px-5 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-pink-700 disabled:cursor-wait disabled:opacity-60"
           >
-            Confirm & Save Parcel
+            {saving ? "Saving to FTM Supabase…" : "Confirm & Save Parcel"}
           </button>
         </div>
       </div>
@@ -1459,8 +1459,8 @@ function ParcelDetailsModal({
   const [status, setStatus] = useState<Parcel["status"]>(parcel.status);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const brand = COURIER_BRANDING[(parcel.courier ?? "LBC") as CourierName] ?? {
-    label: parcel.courier || "LBC",
+  const brand = COURIER_BRANDING[(parcel.courier ?? "Airship Express") as CourierName] ?? {
+    label: parcel.courier || "Airship Express",
     badge: "bg-pink-50 text-pink-700 border-pink-200",
     accent: "bg-pink-600 text-white",
     icon: "L",
@@ -1626,7 +1626,7 @@ function BulkDeliverModal({
           {parcels.map((p) => (
             <div key={p.id} className="flex justify-between font-medium text-slate-700">
               <span className="truncate max-w-[180px]">{p.trackingNumber}</span>
-              <span className="text-pink-600">{p.courier || "LBC"}</span>
+              <span className="text-pink-600">{p.courier || "Airship Express"}</span>
             </div>
           ))}
         </div>

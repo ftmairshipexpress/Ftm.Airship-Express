@@ -51,6 +51,7 @@ export async function GET(request: Request) {
   const auth = await authenticateFtmRequest(request);
   if (!("context" in auth)) return auth.response;
   const { user, profile, serviceClient } = auth.context;
+  const { data: account } = await serviceClient.from("users").select("*").eq("id", user.id).maybeSingle();
 
   let avatarUrl = profile?.avatar_url || user.user_metadata?.avatar_url || null;
   if (typeof avatarUrl === "string" && avatarUrl.startsWith("data:image/")) {
@@ -80,7 +81,49 @@ export async function GET(request: Request) {
     email: user.email || profile?.email || null,
     full_name: user.user_metadata?.full_name || profile?.full_name || null,
     avatar_url: avatarUrl,
+    role: user.role,
+    phone: account?.phone || user.user_metadata?.phone || null,
+    username: account?.username || user.user_metadata?.username || null,
+    employee_id: account?.employee_id_number || account?.employee_id || null,
+    department: account?.department || null,
+    license_number: account?.license_number || account?.driver_license_number || null,
+    license_expiry: account?.license_expiry || account?.license_expiration || null,
+    courier_id: account?.courier_id || null,
+    is_active: account?.is_active !== false,
+    created_at: account?.created_at || user.created_at || null,
+    last_sign_in_at: user.last_sign_in_at || null,
+    updated_at: account?.updated_at || null,
   });
+}
+
+export async function PATCH(request: Request) {
+  const auth = await authenticateFtmRequest(request);
+  if (!("context" in auth)) return auth.response;
+  const { user, serviceClient } = auth.context;
+  let body: { full_name?: unknown; phone?: unknown };
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "A valid JSON request body is required." }, { status: 400 });
+  }
+
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (body.full_name !== undefined) {
+    const fullName = String(body.full_name).trim();
+    if (fullName.length < 2 || fullName.length > 120) return NextResponse.json({ error: "Full name must be between 2 and 120 characters." }, { status: 400 });
+    updates.full_name = fullName;
+  }
+  if (body.phone !== undefined) {
+    const phone = String(body.phone).trim();
+    if (phone.length > 40) return NextResponse.json({ error: "Contact number must be 40 characters or fewer." }, { status: 400 });
+    updates.phone = phone || null;
+  }
+  if (Object.keys(updates).length === 1) return NextResponse.json({ error: "No profile fields were provided." }, { status: 400 });
+
+  const { data, error } = await serviceClient.from("users").update(updates).eq("id", user.id).select("id, full_name, phone, updated_at").maybeSingle();
+  if (error) return NextResponse.json({ error: `Unable to save profile details: ${error.message}` }, { status: 500 });
+  if (!data) return NextResponse.json({ error: "Profile record not found." }, { status: 404 });
+  return NextResponse.json(data);
 }
 
 export async function POST(request: Request) {

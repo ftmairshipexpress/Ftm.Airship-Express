@@ -3,6 +3,7 @@ import { hasPermission } from "../../lib/permissions";
 import { authenticateFtmRequest } from "../../lib/server/ftmRequestAuth";
 import { buildTripPayload, isInTransitStatus, normalizeTrip, normalizeTripStop, notifyDriverTripAssigned, persistTripStops, updateRemoteParcelStatus, updateTripResources, validateTripAssignment } from "../../lib/server/ftmTrips";
 import { isRoutePlanSchemaUnavailable, normalizeRoutePlan } from "../../lib/server/ftmRoutePlans";
+import { belongsToAirshipCourier, getAirshipCouriers, isAirshipCourier } from "../../lib/server/ftmCourier";
 
 export const dynamic = "force-dynamic";
 
@@ -16,12 +17,28 @@ export async function GET(request: Request) {
 
   const url = new URL(request.url);
   const light = url.searchParams.get("light") === "true";
-  let query = context.serviceClient.from("trips").select("*").order("created_at", { ascending: false }).limit(light ? 100 : 200);
+  const allRows = url.searchParams.get("all") === "true";
+  const includePerformanceTimestamps = url.searchParams.get("performance") === "true";
+  const pageSize = light ? 100 : 200;
+  let query = context.serviceClient.from("trips").select("*").order("created_at", { ascending: false });
   const status = url.searchParams.get("status");
   if (status) query = query.eq("status", status);
   const driverId = context.user.role === "driver" ? context.user.id : url.searchParams.get("driver_id");
   if (driverId) query = query.eq("driver_id", driverId);
-  const { data: trips, error } = await query;
+  let trips: Record<string, any>[] = [];
+  let error: { message: string } | null = null;
+  if (allRows) {
+    for (let from = 0; ; from += pageSize) {
+      const result = await query.range(from, from + pageSize - 1);
+      if (result.error) { error = result.error; break; }
+      trips.push(...(result.data || []));
+      if ((result.data || []).length < pageSize) break;
+    }
+  } else {
+    const result = await query.limit(pageSize);
+    trips = result.data || [];
+    error = result.error;
+  }
   if (error) {
     const forbidden = /permission denied|not authorized|rls|jwt/i.test(error.message);
     return NextResponse.json({ error: forbidden ? "RLS policies not configured" : "Unable to load trips", details: error.message }, { status: forbidden ? 403 : 500 });
@@ -30,21 +47,32 @@ export async function GET(request: Request) {
   const tripRows = trips || [];
   const bookingIds = [...new Set(tripRows.map((trip) => trip.booking_id).filter(Boolean))];
   const routePlanIds = [...new Set(tripRows.map((trip) => trip.route_plan_id).filter(Boolean))];
-  const [bookingsResult, stopsResult, routePlansResult, eventsResult, proofResult] = await Promise.all([
-    bookingIds.length ? context.serviceClient.from("bookings").select("id,pickup_location,pickup_latitude,pickup_longitude,dropoff_location,dropoff_latitude,dropoff_longitude,cargo_weight").in("id", bookingIds) : Promise.resolve({ data: [], error: null }),
+  const vehicleIds = [...new Set(tripRows.map((trip) => trip.vehicle_id).filter(Boolean).map(String))];
+  const driverIds = [...new Set(tripRows.map((trip) => trip.driver_id).filter(Boolean).map(String))];
+  const [bookingsResult, stopsResult, routePlansResult, eventsResult, proofResult, vehiclesResult, driversResult, bookingAssignmentsResult] = await Promise.all([
+    bookingIds.length ? context.serviceClient.from("bookings").select("*").in("id", bookingIds) : Promise.resolve({ data: [], error: null }),
     !light && tripRows.length ? context.serviceClient.from("trip_stops").select("trip_id,sequence,name,latitude,longitude,status").in("trip_id", tripRows.map((trip) => trip.id)) : Promise.resolve({ data: [], error: null }),
     routePlanIds.length ? context.serviceClient.from("route_plans").select("*").in("id", routePlanIds) : Promise.resolve({ data: [], error: null }),
     !light && tripRows.length ? context.serviceClient.from("trip_events").select("*").in("trip_id", tripRows.map((trip) => trip.id)).order("created_at", { ascending: true }) : Promise.resolve({ data: [], error: null }),
-    !light && tripRows.length ? context.serviceClient.from("proof_of_delivery").select("*").in("trip_id", tripRows.map((trip) => trip.id)) : Promise.resolve({ data: [], error: null }),
+    tripRows.length && (!light || includePerformanceTimestamps)
+      ? context.serviceClient.from("proof_of_delivery").select(includePerformanceTimestamps ? "trip_id,delivered_at" : "*").in("trip_id", tripRows.map((trip) => trip.id))
+      : Promise.resolve({ data: [], error: null }),
+    vehicleIds.length ? context.serviceClient.from("vehicles").select("id,courier_id").in("id", vehicleIds) : Promise.resolve({ data: [], error: null }),
+    driverIds.length ? context.serviceClient.from("users").select("id,courier_id,role").in("id", driverIds) : Promise.resolve({ data: [], error: null }),
+    bookingIds.length ? context.serviceClient.from("booking_assignments").select("booking_id,driver_id,vehicle_id,route_plan_id").in("booking_id", bookingIds) : Promise.resolve({ data: [], error: null }),
   ]);
   if (routePlansResult.error && !isRoutePlanSchemaUnavailable(routePlansResult.error)) {
     return NextResponse.json({ error: `Unable to load trip route plans: ${routePlansResult.error.message}` }, { status: 500 });
   }
   const isOptionalActivityTableMissing = (error: { message: string } | null) =>
     Boolean(error && /could not find the table|schema cache|relation .* does not exist/i.test(error.message));
-  const activityError = [eventsResult.error, proofResult.error].find((error) => error && !isOptionalActivityTableMissing(error));
-  if (activityError) return NextResponse.json({ error: `Unable to load trip activity: ${activityError.message}` }, { status: 500 });
-  const bookings = new Map((bookingsResult.data || []).map((booking) => [String(booking.id), booking]));
+  const relationshipError = [bookingsResult.error, stopsResult.error, eventsResult.error, proofResult.error, vehiclesResult.error, driversResult.error, bookingAssignmentsResult.error]
+    .find((error) => error && !isOptionalActivityTableMissing(error));
+  if (relationshipError) return NextResponse.json({ error: `Unable to load trip relationships: ${relationshipError.message}` }, { status: 500 });
+  let airshipCourierIds: Set<string>;
+  try { airshipCourierIds = new Set((await getAirshipCouriers(context.serviceClient)).map((courier) => courier.id)); } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unable to resolve Airship Express trips." }, { status: 500 });
+  }
   const eventsByTrip = new Map<string, Record<string, any>[]>();
   (eventsResult.data || []).forEach((event) => {
     const key = String(event.trip_id);
@@ -57,15 +85,52 @@ export async function GET(request: Request) {
     list.push(stop);
     stops.set(String(stop.trip_id), list);
   });
-  const routePlans = new Map((routePlansResult.data || []).map((routePlan) => [String(routePlan.id), normalizeRoutePlan(routePlan)]));
-  return NextResponse.json(tripRows.map((trip) => {
+  const routePlans = new Map((routePlansResult.data || [])
+    .filter((routePlan) => belongsToAirshipCourier(routePlan, airshipCourierIds))
+    .map((routePlan) => [String(routePlan.id), normalizeRoutePlan(routePlan)]));
+  const airshipVehicleIds = new Set((vehiclesResult.data || [])
+    .filter((vehicle) => belongsToAirshipCourier(vehicle, airshipCourierIds))
+    .map((vehicle) => String(vehicle.id)));
+  const airshipDriverIds = new Set((driversResult.data || [])
+    .filter((driver) => String(driver.role || "").toLowerCase() === "driver" && airshipCourierIds.has(String(driver.courier_id || "")))
+    .map((driver) => String(driver.id)));
+  const assignmentByBookingId = new Map((bookingAssignmentsResult.data || []).map((assignment) => [String(assignment.booking_id), assignment]));
+  const bookings = new Map((bookingsResult.data || []).flatMap((booking) => {
+    const routePlan = booking.route_plan_id ? routePlans.get(String(booking.route_plan_id)) : null;
+    const assignment = assignmentByBookingId.get(String(booking.id));
+    const inAirshipScope = belongsToAirshipCourier({
+      ...booking,
+      courier: booking.courier || routePlan?.courier,
+      courier_id: booking.courier_id || routePlan?.courier_id || routePlan?.courierId,
+    }, airshipCourierIds)
+      || Boolean(assignment?.vehicle_id && airshipVehicleIds.has(String(assignment.vehicle_id)))
+      || Boolean(assignment?.driver_id && airshipDriverIds.has(String(assignment.driver_id)));
+    return inAirshipScope ? [[String(booking.id), booking] as const] : [];
+  }));
+  const airshipTrips = tripRows.filter((trip) => {
+    const routePlanId = String(trip.route_plan_id || "");
+    const bookingId = String(trip.booking_id || "");
+    const assignment = bookingId ? assignmentByBookingId.get(bookingId) : null;
+    return isAirshipCourier(trip.courier) || airshipCourierIds.has(String(trip.courier_id || ""))
+      || Boolean(routePlanId && routePlans.has(routePlanId))
+      || Boolean(bookingId && bookings.has(bookingId))
+      || Boolean(trip.vehicle_id && airshipVehicleIds.has(String(trip.vehicle_id)))
+      || Boolean(trip.driver_id && airshipDriverIds.has(String(trip.driver_id)))
+      || Boolean(assignment?.vehicle_id && airshipVehicleIds.has(String(assignment.vehicle_id)))
+      || Boolean(assignment?.driver_id && airshipDriverIds.has(String(assignment.driver_id)));
+  });
+  return NextResponse.json(airshipTrips.map((trip) => {
     const booking = bookings.get(String(trip.booking_id));
     const routePlan = routePlans.get(String(trip.route_plan_id));
+    const assignment = trip.booking_id ? assignmentByBookingId.get(String(trip.booking_id)) : null;
     const tripStops = (stops.get(String(trip.id)) || []).sort((left, right) => left.sequence - right.sequence);
     const routeStops = routePlan?.deliveryDestinations || [];
     const resolvedStops = (tripStops.length ? tripStops : routeStops).map(normalizeTripStop).filter(Boolean);
     return normalizeTrip({
       ...trip,
+      vehicle_id: trip.vehicle_id || assignment?.vehicle_id || null,
+      driver_id: trip.driver_id || assignment?.driver_id || null,
+      route_plan_id: trip.route_plan_id || assignment?.route_plan_id || null,
       routePlan: routePlan || null,
       distance_km: routePlan?.optimizedDistanceKm ?? trip.distance_km,
       duration_minutes: routePlan?.optimizedDurationMinutes ?? trip.duration_minutes,
@@ -114,6 +179,9 @@ export async function POST(request: Request) {
       assignment = await validateTripAssignment(context.serviceClient, payload, payload.driver_id || undefined);
     } catch (error) {
       return NextResponse.json({ error: error instanceof Error ? error.message : "Driver and vehicle are not eligible for this trip." }, { status: 409 });
+    }
+    if (!isAirshipCourier(assignment.courier.name || assignment.courier.code)) {
+      return NextResponse.json({ error: "Only Airship Express resources can be dispatched from VRDS." }, { status: 409 });
     }
     payload.courier_id = assignment.courier.id || payload.courier_id;
   }
