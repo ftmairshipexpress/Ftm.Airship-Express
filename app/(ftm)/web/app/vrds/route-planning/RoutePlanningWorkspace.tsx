@@ -1674,7 +1674,7 @@ export default function RoutePlanningWorkspace() {
               <div><h3 className="text-xs font-bold text-slate-800">Suggested Matching Parcels <span className="ml-1 rounded-full bg-white px-1.5 py-0.5 text-[10px] text-sky-800">{matchingParcelSuggestions.length}</span></h3><p className="text-[10px] text-slate-500">Suggestions are not assigned or optimized unless you add them to the route.</p></div>
               <label className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-600">Within <input aria-label="Suggestion distance threshold in kilometers" type="number" min="1" max="100" step="1" value={suggestionDistanceThresholdKm} onChange={(event) => setSuggestionDistanceThresholdKm(Math.max(1, Math.min(100, Number(event.target.value) || 1)))} className="w-14 rounded-md border border-slate-200 bg-white px-2 py-1 text-right text-xs" /> km</label>
             </div>
-            {matchingParcelSuggestions.length ? <div className="space-y-2">
+            {matchingParcelSuggestions.length ? <div className="max-h-[42rem] space-y-2 overflow-y-auto pr-1 hide-scrollbar">
               {matchingParcelSuggestions.map(({ parcel, distanceKm, reason }) => {
                 const id = String(parcel.id);
                 const tracking = String(parcel.tracking_number || parcel.trackingNumber || id);
